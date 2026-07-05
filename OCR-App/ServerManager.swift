@@ -76,6 +76,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         let start = CFAbsoluteTimeGetCurrent()
         guard let req = Req(buf) else { sendAndClose(fd, 400, "Bad Request", "text/plain"); return }
         let fmt = parseFormat(from: req.path)
+        let isFast = req.path.contains("?fast=1") || req.path.contains("&fast=1")
 
         switch (req.method, req.path.components(separatedBy: "?").first ?? req.path) {
         case ("GET", "/"):
@@ -85,7 +86,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
             sendAndClose(fd, 200, "{\"status\":\"ok\",\"address\":\"\(address):\(port)\"}", "application/json")
             log("GET", "/health", ip, "", 0, 200)
         case ("POST", "/ocr"):
-            handleOCR(fd, req, ip, start, format: fmt)
+            handleOCR(fd, req, ip, start, format: fmt, fast: isFast)
         case ("OPTIONS", _):
             sendAndClose(fd, 204, "", "text/plain")
         default:
@@ -107,7 +108,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         send(fd, status, body, ct); Darwin.close(fd)
     }
 
-    private func handleOCR(_ fd: Int32, _ req: Req, _ ip: String, _ start: CFAbsoluteTime, format: String = "html") {
+    private func handleOCR(_ fd: Int32, _ req: Req, _ ip: String, _ start: CFAbsoluteTime, format: String = "html", fast: Bool = false) {
         guard let b = req.boundary else { sendAndClose(fd, 400, "{\"success\":false,\"error\":\"Expected multipart\"}", "application/json"); return }
         let files = parseMultiAll(req.body, b)
         guard !files.isEmpty else { sendAndClose(fd, 400, "{\"success\":false,\"error\":\"No image\"}", "application/json"); return }
@@ -123,7 +124,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         var allResults: [OCRItem] = []
         let sem = DispatchSemaphore(value: 0)
         Task.detached {
-            allResults = await OCRService.recognizeText(paths: tmpFiles.map { $0.1.path })
+            allResults = await OCRService.recognizeText(paths: tmpFiles.map { $0.1.path }, fast: fast)
             for (_, url) in tmpFiles { try? FileManager.default.removeItem(at: url) }
             sem.signal()
         }

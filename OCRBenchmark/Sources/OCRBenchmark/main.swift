@@ -26,6 +26,16 @@ struct OCRBenchmark {
             }
         }
 
+        let useFast = args.contains("--fast")
+        let useSequential = args.contains("--sequential")
+
+        if useFast && useSequential {
+            print("❌ Can't use --fast and --sequential together.")
+            exit(1)
+        }
+
+        let modeLabel = useFast ? "fast + parallel" : (useSequential ? "accurate + sequential" : "accurate + parallel")
+
         if args.count < 2 || args[1].hasPrefix("-") {
             printUsage()
             exit(1)
@@ -50,12 +60,17 @@ struct OCRBenchmark {
         }
 
         // Run OCR
-        print("🔍 Running OCR on \(images.count) image(s)…")
+        print("🔍 Running OCR on \(images.count) image(s) (\(modeLabel))…")
         print(String(repeating: "─", count: 60))
 
         let startTotal = CFAbsoluteTimeGetCurrent()
         let paths = images.map(\.path)
-        let results = await OCRService.recognizeText(paths: paths)
+        let results: [OCRItem]
+        if useSequential {
+            results = await OCRService.recognizeTextSequential(paths: paths, fast: useFast)
+        } else {
+            results = await OCRService.recognizeText(paths: paths, fast: useFast)
+        }
         let totalElapsed = CFAbsoluteTimeGetCurrent() - startTotal
 
         // Compute stats
@@ -103,10 +118,19 @@ struct OCRBenchmark {
 
         Options:
           --json [path]    Output in JSON format (optionally save to file)
+          --fast           Use .fast recognition level (parallel, 2-3x faster, may miss text)
+          --sequential     Process images one at a time (no parallelism, useful for baseline comparison)
           --help, -h       Show this help
+
+        Modes (default: accurate + parallel):
+          (no flags)       Accurate + parallel (~3× faster than sequential)
+          --fast           Fast + parallel (~6× faster than accurate, may miss text)
+          --sequential     Accurate + sequential (baseline, matches original behavior)
 
         Example:
           swift run OCRBenchmark ~/Screenshots
+          swift run OCRBenchmark ~/Screenshots --fast
+          swift run OCRBenchmark ~/Screenshots --sequential
           swift run OCRBenchmark ~/Screenshots --json results.json
         """)
     }

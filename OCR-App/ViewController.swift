@@ -19,7 +19,8 @@ class ViewController: NSViewController {
 
     var scroll: NSScrollView!; var root: NSStackView!
     var pickBtn: NSButton!; var hintLbl: NSTextField!
-    var infoLbl: NSTextField!; var runBtn: NSButton!
+    var infoLbl: NSTextField!; var runBtn: NSButton!; var fastBtn: NSButton!
+    var runRow: NSStackView!
     var spnr: NSProgressIndicator!; var elapLbl: NSTextField!
     var errLbl: NSTextField!
     var tbl: NSTableView!; var emptySt: NSStackView!; var ovl: NSView!
@@ -85,6 +86,14 @@ class ViewController: NSViewController {
         // Run button
         runBtn = NSButton(title: "Run OCR", target: self, action: #selector(runOCR))
         runBtn.bezelStyle = .regularSquare; runBtn.controlSize = .large
+
+        // Fast mode toggle
+        fastBtn = NSButton(checkboxWithTitle: "Fast mode (~3× faster, may miss text)", target: self, action: nil)
+        fastBtn.font = .systemFont(ofSize: 11)
+
+        // Run row (button + fast toggle)
+        runRow = NSStackView(views: [runBtn, fastBtn])
+        runRow.orientation = .vertical; runRow.spacing = 4
 
         // Elapsed label
         elapLbl = NSTextField(labelWithString: "")
@@ -176,7 +185,7 @@ class ViewController: NSViewController {
         root.addArrangedSubview(pickBtn)
         root.addArrangedSubview(hintLbl)
         root.addArrangedSubview(infoRow)
-        root.addArrangedSubview(runBtn)
+        root.addArrangedSubview(runRow)
         root.addArrangedSubview(elapLbl)
         root.addArrangedSubview(errRow)
         root.addArrangedSubview(resultsHdr)
@@ -257,7 +266,7 @@ class ViewController: NSViewController {
             s.elapLbl.stringValue = String(format: "⏱ %.1fs elapsed  •  %d images", s.elpsd, s.files.count)
         }
         Task {
-            let r = await OCRService.recognizeText(paths: files.map(\.path))
+            let r = await OCRService.recognizeText(paths: files.map(\.path), fast: fastBtn.state == .on)
             await MainActor.run {
                 timer?.invalidate(); self.elpsd = self.t0.map { Date().timeIntervalSince($0) } ?? 0
                 self.swSum = r.reduce(0) { $0 + $1.duration }; self.ocrR = r; self.busy = false
