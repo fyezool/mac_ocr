@@ -16,6 +16,7 @@ class ViewController: NSViewController {
     var files: [URL] = []; var ocrR: [OCRItem]?; var busy = false; var err: String?
     var t0: Date?; var elpsd: Double = 0; var swSum: Double = 0
     let srv = ServerManager(); var srvOn = false; var srvLogs: [ServerLogEntry] = []
+    var generation = 0
 
     var scroll: NSScrollView!; var root: NSStackView!
     var pickBtn: NSButton!; var hintLbl: NSTextField!
@@ -107,8 +108,6 @@ class ViewController: NSViewController {
         errRow.layer?.backgroundColor = NSColor(calibratedRed: 1, green: 0.9, blue: 0.9, alpha: 1).cgColor
         errLbl = NSTextField(wrappingLabelWithString: ""); errLbl.textColor = NSColor(calibratedRed: 0.6, green: 0.1, blue: 0.1, alpha: 1)
         errLbl.isEditable = false; errLbl.isBordered = false; errLbl.backgroundColor = .clear
-        errRow.addArrangedSubview(errLbl)
-
         errRow.addArrangedSubview(errLbl)
 
         // Empty state
@@ -227,7 +226,7 @@ class ViewController: NSViewController {
         var all: [URL] = []
         for u in p.urls { var d: ObjCBool = false; FileManager.default.fileExists(atPath: u.path, isDirectory: &d)
             all.append(contentsOf: d.boolValue ? OCRService.collectImages(from: u) : [u]) }
-        if !all.isEmpty { files = all; ocrR = nil; err = nil; refr() }
+        if !all.isEmpty { guard !busy else { return }; generation &+= 1; files = all; ocrR = nil; err = nil; refr() }
     }
     func drgEnter() { ovl.isHidden = false }
     func drgExit() { ovl.isHidden = true }
@@ -253,22 +252,24 @@ class ViewController: NSViewController {
                 all.append(contentsOf: d.boolValue ? OCRService.collectImages(from: url) : [url])
             }
         }
-        if all.isEmpty { return false }; files = all; ocrR = nil; err = nil; refr(); return true
+        if all.isEmpty { return false }; guard !busy else { return false }; generation &+= 1; files = all; ocrR = nil; err = nil; refr(); return true
     }
     @objc func runOCR() {
         guard !files.isEmpty, !busy else { return }
-        busy = true; err = nil; elpsd = 0; swSum = 0; t0 = Date()
+        busy = true; err = nil; elpsd = 0; swSum = 0; t0 = Date(); let gen = generation
         runBtn.isEnabled = false; elapLbl.isHidden = false; refr()
         var timer: Timer?
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             guard let s = self, s.busy, let st = s.t0 else { timer?.invalidate(); return }
             s.elpsd = Date().timeIntervalSince(st)
-            s.elapLbl.stringValue = String(format: "⏱ %.1fs elapsed  •  %d images", s.elpsd, s.files.count)
+            s.elapLbl.stringValue = String(format: "⏱ %.1fs  •  %d images", s.elpsd, s.files.count)
         }
         Task {
             let r = await OCRService.recognizeText(paths: files.map(\.path), fast: fastBtn.state == .on)
             await MainActor.run {
-                timer?.invalidate(); self.elpsd = self.t0.map { Date().timeIntervalSince($0) } ?? 0
+                timer?.invalidate()
+                guard gen == self.generation else { return }
+                self.elpsd = self.t0.map { Date().timeIntervalSince($0) } ?? 0
                 self.swSum = r.reduce(0) { $0 + $1.duration }; self.ocrR = r; self.busy = false
                 self.runBtn.isEnabled = true; self.refr()
             }
@@ -294,7 +295,7 @@ class ViewController: NSViewController {
     @objc func toggleSrv() { srvOn ? srv.stop() : srv.start(port: 8080) }
 
     @objc func clearAll() {
-        files = []; ocrR = nil; err = nil; elpsd = 0; swSum = 0; busy = false
+        files = []; ocrR = nil; err = nil; elpsd = 0; swSum = 0; busy = false; generation &+= 1
         runBtn.isEnabled = true; elapLbl.isHidden = true
         filePicker.removeAllItems(); resultText.string = ""
         refr()
@@ -322,7 +323,7 @@ class ViewController: NSViewController {
         let hf = !files.isEmpty; let hr = ocrR != nil && !ocrR!.isEmpty; let he = err != nil
         infoLbl.superview?.isHidden = !hf; if hf { infoLbl.stringValue = "\(files.count) file(s) selected" }
         runBtn.isHidden = !hf || hr; runBtn.title = busy ? "Processing…" : "Run OCR"
-        elapLbl.isHidden = !busy
+        elapLbl.isHidden = !busy && ocrR == nil
         errLbl.superview?.isHidden = !he; if he { errLbl.stringValue = err! }
         resultsHdr.isHidden = !hr
         filePicker.isHidden = !hr

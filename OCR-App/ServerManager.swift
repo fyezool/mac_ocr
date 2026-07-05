@@ -30,12 +30,18 @@ final class ServerManager: NSObject, @unchecked Sendable {
     }
 
     func start(port: UInt16 = 8080) {
+        queue.async { self._start(port: port) }
+    }
+
+    private func _start(port: UInt16) {
         guard !running else { return }
         self.port = port
         self.address = localAddress() ?? "127.0.0.1"
         sockfd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard sockfd >= 0 else { notifyStatus(error: "socket() failed"); return }
-        var flags = fcntl(sockfd, F_GETFL, 0); fcntl(sockfd, F_SETFL, flags | O_NONBLOCK)
+        var flags = fcntl(sockfd, F_GETFL, 0)
+        guard flags >= 0 else { Darwin.close(sockfd); sockfd = -1; notifyStatus(error: "fcntl F_GETFL failed"); return }
+        guard fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) >= 0 else { Darwin.close(sockfd); sockfd = -1; notifyStatus(error: "fcntl F_SETFL failed"); return }
         var reuse: Int32 = 1
         setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
         var addr = sockaddr_in()
@@ -53,14 +59,17 @@ final class ServerManager: NSObject, @unchecked Sendable {
             guard cf >= 0 else { if errno == EAGAIN || errno == EWOULDBLOCK { break }; break }
             var fl = fcntl(cf, F_GETFL, 0); fcntl(cf, F_SETFL, fl | O_NONBLOCK)
             let ip = String(cString: inet_ntoa(ca.sin_addr))
-            self?.queue.async { self?.handle(cf, ip: ip) }
+            guard let srv = self else { Darwin.close(cf); break }
+            srv.queue.async { srv.handle(cf, ip: ip) }
         } }
         source?.setCancelHandler { Darwin.close(fd) }
         source?.resume()
         running = true; notifyStatus()
     }
 
-    func stop() { source?.cancel(); source = nil; if sockfd >= 0 { Darwin.close(sockfd); sockfd = -1 }; running = false; notifyStatus() }
+    func stop() { queue.async { self._stop() } }
+
+    private func _stop() { source?.cancel(); source = nil; sockfd = -1; running = false; DispatchQueue.main.async { self.notifyStatus() } }
 
     private func handle(_ fd: Int32, ip: String) {
         var buf = Data(); var tmp = [UInt8](repeating: 0, count: 65536)
@@ -164,7 +173,8 @@ final class ServerManager: NSObject, @unchecked Sendable {
             optRows += "<option value=\"" + safeTxt.replacingOccurrences(of: "\"", with: "&quot;") + "\" data-err=\"" + esc(err) + "\">\(i+1). \(fn)\(status)</option>\n"
         }
 
-        let html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>OCR</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f5f5f7;color:#1d1d1f;padding:40px 20px;display:flex;justify-content:center}.card{background:#fff;border-radius:18px;padding:32px;max-width:640px;width:100%}h1{font-size:22px;font-weight:600;margin-bottom:4px}.s{color:#6e6e73;font-size:14px;margin-bottom:20px}.top{display:flex;gap:8px;margin-bottom:16px}.top a,.top button{padding:10px 20px;border-radius:8px;font-size:13px;font-weight:500;text-decoration:none;text-align:center;flex:1;border:none;cursor:pointer}.top .sv{background:#007aff;color:#fff}.top .cl{background:#fff;color:#1d1d1f;border:1px solid #e5e5ea}select{width:100%;padding:10px 12px;border:1px solid #c7c7cc;border-radius:10px;font-size:14px;background:#fff;margin-bottom:12px;appearance:auto}.out{background:#f5f5f7;border:1px solid #e5e5ea;border-radius:10px;padding:16px;min-height:150px;font-family:Menlo,monospace;font-size:13px;white-space:pre-wrap;word-break:break-word;margin-bottom:12px}.e{color:#ff3b30;font-size:12px;margin-bottom:8px}#sv{background:none;border:none;font-size:13px;color:#007aff;cursor:pointer;float:right;margin-top:4px}</style></head><body><div class=\"card\"><h1>📄 OCR</h1><p class=\"s\">" + String(results.count) + " file(s)  •  ⏱ " + String(format: "%.1fs", el) + "</p><div class=\"top\"><button class=\"sv\" id=\"sv\">💾 Save All</button><button class=\"cl\" id=\"cp\">📋 Copy</button><a class=\"cl\" href=\"/\">✕ Clear</a></div><div id=\"err\"></div><select id=\"sel\" onchange=\"show()\">" + optRows + "</select><div class=\"out\" id=\"out\">" + firstText + "</div></div><script>var d=" + (try? String(data: JSONEncoder().encode(results), encoding: .utf8))! + ";function show(){var s=document.getElementById('sel');var i=s.selectedIndex;if(d&&i>=0&&i<d.length){document.getElementById('out').textContent=d[i].text||'(no text)';document.getElementById('err').textContent=d[i].error?'⚠️ '+d[i].error:''}}document.getElementById('sv').onclick=function(){var t='';for(var i=0;i<d.length;i++){t+='--- '+d[i].filename+' ---\\n'+(d[i].text||'(no text)')+'\\n\\n'}var a=document.createElement('a');a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(t);a.download='ocr_results.txt';a.click()};document.getElementById('cp').onclick=function(){var s=document.getElementById('sel');var i=s.selectedIndex;if(d&&i>=0&&i<d.length){navigator.clipboard.writeText(d[i].text||'')}}</script></body></html>"
+        let jsonData = ((try? JSONEncoder().encode(results)).flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
+        let html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>OCR</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f5f5f7;color:#1d1d1f;padding:40px 20px;display:flex;justify-content:center}.card{background:#fff;border-radius:18px;padding:32px;max-width:640px;width:100%}h1{font-size:22px;font-weight:600;margin-bottom:4px}.s{color:#6e6e73;font-size:14px;margin-bottom:20px}.top{display:flex;gap:8px;margin-bottom:16px}.top a,.top button{padding:10px 20px;border-radius:8px;font-size:13px;font-weight:500;text-decoration:none;text-align:center;flex:1;border:none;cursor:pointer}.top .sv{background:#007aff;color:#fff}.top .cl{background:#fff;color:#1d1d1f;border:1px solid #e5e5ea}select{width:100%;padding:10px 12px;border:1px solid #c7c7cc;border-radius:10px;font-size:14px;background:#fff;margin-bottom:12px;appearance:auto}.out{background:#f5f5f7;border:1px solid #e5e5ea;border-radius:10px;padding:16px;min-height:150px;font-family:Menlo,monospace;font-size:13px;white-space:pre-wrap;word-break:break-word;margin-bottom:12px}.e{color:#ff3b30;font-size:12px;margin-bottom:8px}#sv{background:none;border:none;font-size:13px;color:#007aff;cursor:pointer;float:right;margin-top:4px}</style></head><body><div class=\"card\"><h1>📄 OCR</h1><p class=\"s\">" + String(results.count) + " file(s)  •  ⏱ " + String(format: "%.1fs", el) + "</p><div class=\"top\"><button class=\"sv\" id=\"sv\">💾 Save All</button><button class=\"cl\" id=\"cp\">📋 Copy</button><a class=\"cl\" href=\"/\">✕ Clear</a></div><div id=\"err\"></div><select id=\"sel\" onchange=\"show()\">" + optRows + "</select><div class=\"out\" id=\"out\">" + firstText + "</div></div><script>var d=" + jsonData + ";function show(){var s=document.getElementById('sel');var i=s.selectedIndex;if(d&&i>=0&&i<d.length){document.getElementById('out').textContent=d[i].text||'(no text)';document.getElementById('err').textContent=d[i].error?'⚠️ '+d[i].error:''}}document.getElementById('sv').onclick=function(){var t='';for(var i=0;i<d.length;i++){t+='--- '+d[i].filename+' ---\\n'+(d[i].text||'(no text)')+'\\n\\n'}var a=document.createElement('a');a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(t);a.download='ocr_results.txt';a.click()};document.getElementById('cp').onclick=function(){var s=document.getElementById('sel');var i=s.selectedIndex;if(d&&i>=0&&i<d.length){navigator.clipboard.writeText(d[i].text||'')}}</script></body></html>"
 
         sendAndClose(fd, 200, html, "text/html; charset=utf-8")
         log("POST", "/ocr", ip, "\(results.count) files", el, 200)
@@ -177,11 +187,19 @@ final class ServerManager: NSObject, @unchecked Sendable {
     // MARK: - Helpers
 
     private func send(_ fd: Int32, _ status: Int, _ body: String, _ ct: String) {
-        let st = ["200":"OK","400":"Bad Request","404":"Not Found","500":"Internal Server Error"][String(status)] ?? ""
-        let bd = body.data(using: .utf8)!
+        let st = ["200":"OK","204":"No Content","400":"Bad Request","404":"Not Found","500":"Internal Server Error"][String(status)] ?? ""
+        let bd = body.data(using: .utf8) ?? Data()
         let resp = "HTTP/1.1 \(status) \(st)\r\nContent-Type: \(ct)\r\nContent-Length: \(bd.count)\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
-        var data = resp.data(using: .utf8)!; data.append(bd)
-        _ = data.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        guard var data = resp.data(using: .utf8) else { return }; data.append(bd)
+        data.withUnsafeBytes { buf in
+            guard let base = buf.baseAddress else { return }
+            var written = 0
+            while written < data.count {
+                let n = write(fd, base + written, data.count - written)
+                if n <= 0 { break }
+                written += n
+            }
+        }
     }
 
     private func log(_ m: String, _ p: String, _ r: String, _ f: String, _ d: TimeInterval, _ s: Int) {
@@ -248,7 +266,7 @@ private struct Req {
         var h: [String: String] = [:]
         for line in hL.dropFirst() { if let c = line.firstIndex(of: ":") { h[String(line[line.startIndex..<c]).trimmingCharacters(in: .whitespaces)] = String(line[line.index(after: c)...]).trimmingCharacters(in: .whitespaces) } }
         body = Data(data[hdrEnd.upperBound...])
-        if let ct = h["Content-Type"], ct.hasPrefix("multipart/form-data"), let br = ct.range(of: "boundary=") { boundary = String(ct[br.upperBound...]).trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "") } else { boundary = nil }
+        if let ct = h["Content-Type"], ct.hasPrefix("multipart/form-data"), let br = ct.range(of: "boundary=") { boundary = String(ct[br.upperBound...]).trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "").removingPercentEncoding ?? "" } else { boundary = nil }
     }
 }
 
@@ -257,12 +275,14 @@ private func localAddress() -> String? {
     guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }; defer { freeifaddrs(ifaddr) }
     var cur = first
     while true {
-        let i = cur.pointee; let f = i.ifa_addr.pointee.sa_family
+        let i = cur.pointee
+        guard let addrPtr = i.ifa_addr else { guard let next = i.ifa_next else { break }; cur = next; continue }
+        let f = addrPtr.pointee.sa_family
         if f == AF_INET {
             let name = String(cString: i.ifa_name)
             if name.hasPrefix("en") || name.hasPrefix("eth") || name.hasPrefix("ap") {
                 var h = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                getnameinfo(i.ifa_addr, socklen_t(i.ifa_addr.pointee.sa_len), &h, socklen_t(h.count), nil, 0, NI_NUMERICHOST)
+                getnameinfo(addrPtr, socklen_t(addrPtr.pointee.sa_len), &h, socklen_t(h.count), nil, 0, NI_NUMERICHOST)
                 let c = String(cString: h)
                 if c != "127.0.0.1" && !c.hasPrefix("169.254") { addr = c; break }
             }
@@ -309,7 +329,7 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 <div class="st" id="st"></div>
 </div>
 <script>
-var dz=document.getElementById('dz'),fi=document.getElementById('fi'),cnt=document.getElementById('cnt'),fl=document.getElementById('fl'),go=document.getElementById('go'),st=document.getElementById('st'),fast=document.getElementById('fast');
+var dz=document.getElementById('dz'),fi=document.getElementById('fi'),cnt=document.getElementById('cnt'),go=document.getElementById('go'),st=document.getElementById('st'),fast=document.getElementById('fast');
 var sel=[];var xhr;
 var exts=['png','jpg','jpeg','gif','bmp','tiff','tif','heic','webp'];
 dz.onclick=function(){fi.click()};
@@ -317,7 +337,7 @@ fi.onchange=function(){sel=[];for(var i=0;i<fi.files.length;i++)sel.push(fi.file
 dz.ondragover=function(e){e.preventDefault();dz.classList.add('dragover')};
 dz.ondragleave=function(){dz.classList.remove('dragover')};
 dz.ondrop=function(e){e.preventDefault();dz.classList.remove('dragover');sel=[];for(var i=0;i<e.dataTransfer.files.length;i++)sel.push(e.dataTransfer.files[i]);listar()};
-function listar(){cnt.textContent=sel.length+' file(s)';fl.innerHTML='';var bad=0;for(var i=0;i<sel.length;i++){var n=sel[i].name;var e=n.split('.').pop().toLowerCase();if(exts.indexOf(e)<0)bad++}if(bad)st.textContent='⚠️ '+bad+' of '+sel.length+' file(s) have unsupported formats';else st.textContent='';st.className=bad?'st e':'st'}
+function listar(){cnt.textContent=sel.length+' file(s)';var bad=0;for(var i=0;i<sel.length;i++){var n=sel[i].name;var e=n.split('.').pop().toLowerCase();if(exts.indexOf(e)<0)bad++}if(bad)st.textContent='⚠️ '+bad+' of '+sel.length+' file(s) have unsupported formats';else st.textContent='';st.className=bad?'st e':'st'}
 go.onclick=function(){if(!sel.length){st.className='st e';st.textContent='Select files first';return}st.className='st';st.textContent='Processing '+sel.length+' file(s)...';var t0=Date.now();var timer=setInterval(function(){var e=((Date.now()-t0)/1000).toFixed(1);st.textContent='⏱ '+e+'s  •  '+sel.length+' file(s)'},100);var fd=new FormData();for(var i=0;i<sel.length;i++)fd.append('image',sel[i]);var url='/ocr'+(fast.checked?'?fast=1':'');xhr=new XMLHttpRequest();xhr.open('POST',url,true);xhr.onload=function(){clearInterval(timer);if(xhr.status==200){document.write(xhr.responseText)}else{st.className='st e';st.textContent='Error'}};xhr.onerror=function(){clearInterval(timer);st.className='st e';st.textContent='Connection error'};xhr.send(fd)};
 </script>
 </body></html>

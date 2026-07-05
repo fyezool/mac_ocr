@@ -10,7 +10,6 @@ struct OCRBenchmark {
         let args = CommandLine.arguments
 
         // Parse arguments
-        let folderPath: String
         var outputFormat = Format.table
         var saveJsonPath: String?
 
@@ -36,11 +35,12 @@ struct OCRBenchmark {
 
         let modeLabel = useFast ? "fast + parallel" : (useSequential ? "accurate + sequential" : "accurate + parallel")
 
-        if args.count < 2 || args[1].hasPrefix("-") {
+        // Find first non-flag argument as folder path
+        let pathArg = args.dropFirst().first { !$0.hasPrefix("-") }
+        guard let folderPath = pathArg else {
             printUsage()
             exit(1)
         }
-        folderPath = args[1]
 
         // Collect images
         let folderURL = URL(fileURLWithPath: (folderPath as NSString).expandingTildeInPath)
