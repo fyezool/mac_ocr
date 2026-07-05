@@ -31,8 +31,16 @@ private class OCRPlugin: NSObject, FlutterPlugin {
         
         for path in paths {
             let url = URL(fileURLWithPath: path)
+            let start = CFAbsoluteTimeGetCurrent()
+            
             guard let imageData = try? Data(contentsOf: url) else {
-                results.append(["filename": url.lastPathComponent, "text": "", "error": "Could not load image"])
+                let elapsed = CFAbsoluteTimeGetCurrent() - start
+                results.append([
+                    "filename": url.lastPathComponent,
+                    "text": "",
+                    "error": "Could not load image",
+                    "duration": elapsed,
+                ])
                 continue
             }
             
@@ -46,13 +54,21 @@ private class OCRPlugin: NSObject, FlutterPlugin {
                 let observations = try await request.perform(on: imageData)
                 recognizedText = observations.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
             } catch {
-                results.append(["filename": url.lastPathComponent, "text": "", "error": error.localizedDescription])
+                let elapsed = CFAbsoluteTimeGetCurrent() - start
+                results.append([
+                    "filename": url.lastPathComponent,
+                    "text": "",
+                    "error": error.localizedDescription,
+                    "duration": elapsed,
+                ])
                 continue
             }
             
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
             results.append([
                 "filename": url.lastPathComponent,
                 "text": recognizedText,
+                "duration": elapsed,
             ])
         }
         
@@ -79,6 +95,11 @@ class AppDelegate: FlutterAppDelegate {
     guard let controller = mainFlutterWindow?.contentViewController as? FlutterViewController else { return }
     if #available(macOS 15.0, *) {
         OCRPlugin.register(with: controller.registrar(forPlugin: "OCRPlugin"))
+    }
+
+    // In benchmark mode, hide the window — the Dart side handles everything.
+    if ProcessInfo.processInfo.arguments.contains(where: { $0.hasPrefix("--benchmark") }) {
+        mainFlutterWindow?.orderOut(nil)
     }
   }
 }

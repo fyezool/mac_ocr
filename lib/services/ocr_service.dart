@@ -4,11 +4,13 @@ class OCRResult {
   final String filename;
   final String text;
   final String? error;
+  final double duration;  // seconds spent on this file
 
   OCRResult({
     required this.filename,
     required this.text,
     this.error,
+    this.duration = 0,
   });
 
   factory OCRResult.fromJson(Map json) {
@@ -16,6 +18,7 @@ class OCRResult {
       filename: json['filename'] as String? ?? '',
       text: json['text'] as String? ?? '',
       error: json['error'] as String?,
+      duration: (json['duration'] as num?)?.toDouble() ?? 0,
     );
   }
 }

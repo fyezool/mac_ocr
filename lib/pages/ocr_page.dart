@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -25,6 +26,12 @@ class _OcrPageState extends State<OcrPage> {
   bool _isDragging = false;
   String? _error;
 
+  // Benchmark tracking
+  Stopwatch _stopwatch = Stopwatch();
+  Timer? _elapsedTimer;
+  double _elapsedSeconds = 0;
+  double _totalProcessedSeconds = 0; // sum of per-file durations from Swift
+
   Future<void> _pickImages() async {
     final result = await FilePicker.pickFiles(
       type: FileType.image,
@@ -33,6 +40,35 @@ class _OcrPageState extends State<OcrPage> {
     if (result != null && result.files.isNotEmpty) {
       _addFiles(result.files.map((f) => _FileItem(f.name, f.path ?? '')).toList());
     }
+  }
+
+  static const _imageExtensions = {
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif', '.heic', '.webp',
+  };
+
+  /// Recursively scan [directory] for files with supported image extensions.
+  /// Skips hidden entries (names starting with '.').
+  List<_FileItem> _collectImagesFromDirectory(Directory directory) {
+    final items = <_FileItem>[];
+    try {
+      final entities = directory.listSync(followLinks: false);
+      for (final entity in entities) {
+        if (entity is Directory) {
+          final name = entity.path.split(Platform.pathSeparator).last;
+          if (!name.startsWith('.')) {
+            items.addAll(_collectImagesFromDirectory(entity));
+          }
+        } else if (entity is File) {
+          final name = entity.path.split(Platform.pathSeparator).last;
+          if (_imageExtensions.any((ext) => name.toLowerCase().endsWith(ext))) {
+            items.add(_FileItem(name, entity.path));
+          }
+        }
+      }
+    } catch (_) {
+      // Skip directories that can't be read.
+    }
+    return items;
   }
 
   void _addFiles(List<_FileItem> files) {
@@ -45,13 +81,17 @@ class _OcrPageState extends State<OcrPage> {
 
   void _onDrop(drop.DropDoneDetails details) {
     setState(() => _isDragging = false);
-    const imageExtensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif', '.heic', '.webp'};
-    final imageFiles = details.files
-        .where((f) => imageExtensions.any((ext) => f.name.toLowerCase().endsWith(ext)))
-        .map((f) => _FileItem(f.name, f.path))
-        .toList();
-    if (imageFiles.isEmpty) return;
-    _addFiles(imageFiles);
+    final allFiles = <_FileItem>[];
+    for (final f in details.files) {
+      final entity = FileSystemEntity.typeSync(f.path);
+      if (entity == FileSystemEntityType.directory) {
+        allFiles.addAll(_collectImagesFromDirectory(Directory(f.path)));
+      } else if (_imageExtensions.any((ext) => f.name.toLowerCase().endsWith(ext))) {
+        allFiles.add(_FileItem(f.name, f.path));
+      }
+    }
+    if (allFiles.isEmpty) return;
+    _addFiles(allFiles);
   }
 
   String _allText() =>
@@ -105,21 +145,60 @@ class _OcrPageState extends State<OcrPage> {
     setState(() {
       _isProcessing = true;
       _error = null;
+      _elapsedSeconds = 0;
+      _totalProcessedSeconds = 0;
+    });
+
+    // Start elapsed-time timer
+    _stopwatch.reset();
+    _stopwatch.start();
+    _elapsedTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
+      if (!mounted) return;
+      setState(() {
+        _elapsedSeconds = _stopwatch.elapsedMilliseconds / 1000.0;
+      });
     });
 
     try {
       final paths = _selectedFiles.map((f) => f.path).toList();
       final results = await OcrService.recognizeText(paths);
+      _stopwatch.stop();
+      _elapsedTimer?.cancel();
+      _elapsedSeconds = _stopwatch.elapsedMilliseconds / 1000.0;
+      _totalProcessedSeconds = results.fold<double>(0, (s, r) => s + r.duration);
       setState(() {
         _results = results;
         _isProcessing = false;
       });
     } catch (e) {
+      _stopwatch.stop();
+      _elapsedTimer?.cancel();
       setState(() {
         _error = e.toString();
         _isProcessing = false;
       });
     }
+  }
+
+  @override
+  void dispose() {
+    _elapsedTimer?.cancel();
+    super.dispose();
+  }
+
+  // ─── Benchmark helpers ───
+
+  Widget _statRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Row(
+        children: [
+          Text(label, style: TextStyle(color: Colors.grey.shade700, fontSize: 13)),
+          const Spacer(),
+          Text(value, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+        ],
+      ),
+    );
   }
 
   @override
@@ -155,7 +234,7 @@ class _OcrPageState extends State<OcrPage> {
 
                   const SizedBox(height: 8),
                   Text(
-                    '… or drop images anywhere on this window',
+                    '… or drop images/folders anywhere on this window',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: Colors.grey.shade500, fontSize: 12),
                   ),
@@ -194,13 +273,24 @@ class _OcrPageState extends State<OcrPage> {
                               child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
                             )
                           : const Icon(Icons.text_snippet),
-                      label: Text(_isProcessing ? 'Processing...' : 'Run OCR'),
+                      label: Text(_isProcessing ? 'Processing…' : 'Run OCR'),
                       style: ElevatedButton.styleFrom(
                         padding: const EdgeInsets.symmetric(vertical: 16),
                         backgroundColor: Colors.blue,
                         foregroundColor: Colors.white,
                       ),
                     ),
+
+                    // Elapsed time while processing
+                    if (_isProcessing)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          '⏱ ${_elapsedSeconds.toStringAsFixed(1)}s elapsed  •  ${_selectedFiles.length} images',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Colors.grey.shade600, fontSize: 13),
+                        ),
+                      ),
                   ],
 
                   if (_error != null) ...[
@@ -214,6 +304,41 @@ class _OcrPageState extends State<OcrPage> {
                             Icon(Icons.error, color: Colors.red.shade700),
                             const SizedBox(width: 8),
                             Expanded(child: Text(_error!, style: TextStyle(color: Colors.red.shade700))),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+
+                  // Benchmark summary card
+                  if (hasResults) ...[
+                    const SizedBox(height: 16),
+                    Card(
+                      color: Colors.blue.shade50,
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Icon(Icons.speed, size: 18, color: Colors.blue.shade700),
+                                const SizedBox(width: 6),
+                                Text('Benchmark',
+                                  style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue.shade700)),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            _statRow('Wall-clock time', '${_elapsedSeconds.toStringAsFixed(3)}s'),
+                            _statRow('Sum of durations', '${_totalProcessedSeconds.toStringAsFixed(3)}s'),
+                            _statRow('Average per image',
+                              '${(_totalProcessedSeconds / _results!.length).toStringAsFixed(3)}s'),
+                            _statRow('Throughput',
+                              '${(_results!.length / _elapsedSeconds).toStringAsFixed(1)} images/s'),
+                            _statRow('Successful', '${_results!.where((r) => r.text.isNotEmpty).length}'),
+                            _statRow('Empty', '${_results!.where((r) => r.text.isEmpty && r.error == null).length}'),
+                            if (_results!.any((r) => r.error != null))
+                              _statRow('Failed', '${_results!.where((r) => r.error != null).length}'),
                           ],
                         ),
                       ),
@@ -306,7 +431,7 @@ class _OcrPageState extends State<OcrPage> {
                             Icon(Icons.photo_library_outlined, size: 64, color: Colors.grey.shade400),
                             const SizedBox(height: 16),
                             Text(
-                              'Select one or more images\nto extract text',
+                              'Select images or folders\nto extract text',
                               textAlign: TextAlign.center,
                               style: TextStyle(color: Colors.grey.shade600, fontSize: 16),
                             ),
@@ -338,7 +463,7 @@ class _OcrPageState extends State<OcrPage> {
                         Icon(Icons.cloud_upload_outlined, size: 64, color: Colors.blue.shade400),
                         const SizedBox(height: 12),
                         Text(
-                          'Drop images here',
+                          'Drop images or folders here',
                           style: TextStyle(
                             fontSize: 20,
                             fontWeight: FontWeight.bold,

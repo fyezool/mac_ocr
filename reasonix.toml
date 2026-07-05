@@ -1,0 +1,88 @@
+# Reasonix configuration.
+# Resolution order: flag > ./reasonix.toml > ~/Library/Application Support/reasonix/config.toml > built-in defaults.
+# Secrets come from the environment via api_key_env; never put keys here.
+
+config_version = 2   # schema marker for diagnostics; old versions may ignore it
+default_model = "deepseek-flash"
+# language      = "zh"   # ui/model language; empty = auto-detect from $LANG / $REASONIX_LANG
+
+[agent]
+# system_prompt = """..."""   # omit to use the built-in prompt for this version
+# system_prompt_file = "prompts/system.md"   # overrides system_prompt when set
+max_steps         = 0   # executor tool-call rounds; 0 = no limit
+planner_max_steps = 12   # planner read-only tool-call rounds; 0 = no limit
+temperature       = 0.0
+auto_plan   = "off"   # off|on; off keeps plan mode manual
+# reasoning_language = "zh"   # visible reasoning language: auto|zh|en
+# auto_plan_classifier = "deepseek-flash"   # optional; only used for borderline tasks
+soft_compact_ratio  = 0.5   # notice only; keeps cache-first prefix intact
+compact_ratio       = 0.8   # try compacting when prompt reaches this fraction
+compact_force_ratio = 0.9   # force compacting at this high-water mark
+cold_resume_prune   = true   # elide stale tool results when reopening a session past the provider cache window
+# planner_model = "mimo"   # optional: enable two-model collaboration
+# subagent_model = "deepseek-pro"   # optional default for runAs=subagent skills
+# subagent_models = { review = "deepseek-pro", security_review = "deepseek-pro" }   # per-skill overrides
+# subagent_effort = "high"   # optional default effort for subagents
+# subagent_efforts = { review = "max", task = "high" }   # per-tool/skill effort overrides
+# output_style = "explanatory"   # explanatory | learning | concise | custom; empty = default
+
+[tools]
+enabled = []   # empty = all built-in tools
+bash_timeout_seconds = 120   # foreground safety cap; set 0 for no tool-local cap
+
+[codegraph]
+enabled      = true   # built-in MCP server; off by default for first-run sessions
+auto_install = true   # fetch the runtime when CodeGraph is enabled but missing
+# path       = ""   # empty = cache, then PATH, then a bundle beside reasonix
+
+[builtin_mcp]
+time_enabled = true   # built-in Time MCP; off until manually enabled
+context7_enabled = false   # built-in Context7 MCP; off until manually enabled
+
+[lsp]
+enabled = true   # language server tools; servers launch lazily when used
+# [lsp.servers.go]
+# command = "gopls"
+# args = []
+# extensions = [".go"]
+
+[skills]
+# paths = ["~/my-skills", "../shared/skills"]   # extra custom skill roots
+# excluded_paths = ["~/.agents/skills"]   # hide convention roots without deleting folders
+# max_depth = 3   # nested scan depth; set 1 for legacy root-only discovery
+# disabled_skills = ["review"]   # hide noisy or unwanted skills
+
+[permissions]
+# Per-call gating. mode = writer fallback when no rule matches: ask|allow|deny.
+# Readers always default to allow. Precedence: deny > ask > allow > fallback.
+# Rules are "Tool" or "Tool(specifier)"; e.g. Bash(go test:*), Edit(src/**).
+mode  = "ask"
+# deny = ["Bash(rm -rf*)", "Bash(git push*)"]   # hard-blocked in every mode
+allow = ["explore", "Edit", "Bash(cd /Users/fyezool/Documents/Development/ocr-mac/ocr_app && flutter analyze 2>&1)", "Bash(cd /Users/fyezool/Documents/Development/ocr-mac/ocr_app && dart analyze 2>&1)", "Bash(which dart && dart --version 2>&1)", "Bash(cd /Users/fyezool/Documents/Development/ocr-mac/ocr_app && dart format --set-exit-if-changed lib/pages/ocr_page.dart 2>&1 || true)", "Bash(ls -la /Users/fyezool/flutter/bin/cache/engine.stamp 2>&1; file /Users/fyezool/flutter/bin/cache/engine.stamp 2>&1)", "Bash(/Users/fyezool/flutter/bin/cache/dart-sdk/bin/dart analyze lib/ 2>&1)", "Bash(/Users/fyezool/flutter/bin/cache/dart-sdk/bin/dart analyze lib/ 2>&1 || true)", "Bash(/Users/fyezool/flutter/bin/cache/dart-sdk/bin/dart analyze lib/ 2>&1 | head -2)", "Bash(mkdir -p:*)", "Bash(cd ocr-native/OCRBenchmark && swift build 2>&1)", "Bash(swift --version 2>&1)", "Bash(cd ocr-native/OCRBenchmark && swift build --disable-sandbox 2>&1)", "Bash(find ocr-native -type f -not -path '*/\\.build/*' -not -path '*/.git/*' | sort)", "Bash(cd ocr-native && plutil -lint OCR-App.xcodeproj/project.pbxproj 2>&1)", "Bash(find ~/Desktop ~/Downloads ~/Documents -maxdepth 3 -type d -name \"*screenshot*\" -o -name \"*Screenshot*\" -o -name \"*test*img*\" 2>/dev/null | head -5; mdfind \"kMDItemKind == 'PNG image' || kMDItemKind == 'JPEG image'\" -onlyin ~/Desktop 2>/dev/null | head -5)", "Bash(# Test with the current project's macOS Runner assets if any\nfind . -name \"*.png\" -o -name \"*.jpg\" -o -name \"*.jpeg\" 2>/dev/null | head -10)", "Bash(cd ocr-native/OCRBenchmark && swift run -c release --disable-sandbox OCRBenchmark \"../../macos/Runner/Assets.xcassets/AppIcon.appiconset\" --json 2>&1)", "Bash(cd ocr-native/OCRBenchmark && swift run -c release --disable-sandbox OCRBenchmark \"../../macos/Runner/Assets.xcassets/AppIcon.appiconset\" 2>&1)", "Bash(cd ocr-native/OCRBenchmark && swift run -c release --disable-sandbox OCRBenchmark --help 2>&1 | tail -15)", "Bash(chmod +x:*)", "Bash(cd ocr-native/OCRBenchmark && swift build -c release --disable-sandbox 2>&1 && swift run -c release --disable-sandbox OCRBenchmark \"../../macos/Runner/Assets.xcassets/AppIcon.appiconset\" 2>&1)", "Bash(cd ocr-native/OCRBenchmark && swift build -c release --disable-sandbox 2>&1 | tail -5)", "Bash(flutter analyze 2>&1)", "Bash(dart analyze lib/ 2>&1)", "Bash(flutter build macos --no-pub 2>&1 | tail -20)", "Bash(cd ocr-native/OCRBenchmark && swift build -c release --disable-sandbox 2>&1 | grep -E \"(error|Build complete)\")", "Bash(echo \"=== Flutter project (new/modified files) ===\" && ls -la lib/benchmark_main.dart tool/flutter_benchmark.sh && echo \"\" && echo \"=== Changes to existing files ===\" && grep -n \"duration\" lib/services/ocr_service.dart && echo \"\" && grep -n \"duration\" macos/Runner/AppDelegate.swift && echo \"\" && echo \"=== Native Swift project ===\" && find ocr-native -type f -not -path '*/\\.build/*' | sort)", "Bash(cd ocr-native/OCRBenchmark && swift run -c release --disable-sandbox OCRBenchmark \"../../macos/Runner/Assets.xcassets/AppIcon.appiconset\" --json 2>&1 | python3 -c \"import sys,json; d=json.load(sys.stdin); print(f'Native Swift benchmark OK — {d[\\\"summary\\\"][\\\"total_images\\\"]} images, {d[\\\"summary\\\"][\\\"images_per_second\\\"]:.1f} img/s')\")", "Bash(cd ocr-native/OCRBenchmark && swift run -c release --disable-sandbox OCRBenchmark \"../../macos/Runner/Assets.xcassets/AppIcon.appiconset\" --json 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(f'Native Swift benchmark OK — {d[\\\"summary\\\"][\\\"total_images\\\"]} images, {d[\\\"summary\\\"][\\\"images_per_second\\\"]:.1f} img/s')\")", "Bash(cd ocr-native/OCRBenchmark && swift run -c release --disable-sandbox OCRBenchmark \"../../macos/Runner/Assets.xcassets/AppIcon.appiconset\" 2>/dev/null | head -5)", "Bash(cd /Users/fyezool/Documents/Development/ocr-mac/ocr_app && flutter build macos --target lib/benchmark_main.dart --no-pub 2>&1 | tail -20)", "Bash(dart format --set-exit-if-changed lib/benchmark_main.dart 2>&1)", "Bash(# Check if the import path is correct by looking at what flutter/widgets.dart exports\nhead -5 /Users/fyezool/flutter/packages/flutter/lib/widgets.dart 2>/dev/null || echo \"can't access flutter SDK\"\n# Check if WidgetsFlutterBinding is in the binding export\ngrep -l \"WidgetsFlutterBinding\" /Users/fyezool/flutter/packages/flutter/lib/widgets.dart 2>/dev/null || echo \"checking manually\")", "Bash(cd /Users/fyezool/Documents/Development/ocr-mac/ocr_app && flutter build macos 2>&1 | tail -15)", "Bash(ls -la README.md ocr-native/README.md 2>/dev/null; echo \"---\"; ls -la *.md 2>/dev/null)"]
+# ask = ["Edit(src/**)"]   # force a prompt even if otherwise allowed
+
+[sandbox]
+# Confine tool blast radius. File-writers (write_file/edit_file/multi_edit)
+# may only write under workspace_root (empty = current dir) + allow_write.
+# bash = "enforce" (default) jails each command in an OS sandbox (macOS now;
+# graceful fallback elsewhere); "off" disables it. network allows egress.
+# workspace_root = ""            # default: current working directory
+# allow_write = ["/tmp"]          # extra dirs writers may also modify
+bash    = "enforce"
+network = true
+
+[statusline]
+# A custom status line: a command whose first stdout line replaces the built-in
+# data row. It receives {"model","contextUsed","contextWindow","cwd"} as JSON on stdin.
+# command = "my-statusline.sh"
+
+# External MCP servers. type: "stdio" (default, a subprocess) | "http" | "sse".
+# ${VAR} / ${VAR:-default} are expanded from the environment in command/args/env/url/headers.
+# [[plugins]]
+# name    = "example"
+# command = "reasonix-plugin-example"
+# [[plugins]]                                  # a remote server over Streamable HTTP
+# name    = "stripe"
+# type    = "http"
+# url     = "https://mcp.stripe.com"
+# headers = { Authorization = "Bearer ${STRIPE_KEY}" }
