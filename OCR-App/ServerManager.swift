@@ -285,7 +285,9 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 .zone{border:2px dashed #c7c7cc;border-radius:12px;padding:30px;text-align:center;margin-bottom:16px;cursor:pointer;background:#fff}
 .zone:hover,.zone.dragover{border-color:#007aff;background:#f0f7ff}
 .zone p{color:#6e6e73;font-size:14px}
-.go{display:block;width:100%;padding:12px;border:none;border-radius:10px;font-size:15px;font-weight:500;cursor:pointer;text-align:center;background:#007aff;color:#fff;margin-bottom:12px}
+.go{display:block;width:100%;padding:12px;border:none;border-radius:10px;font-size:15px;font-weight:500;cursor:pointer;text-align:center;background:#007aff;color:#fff;margin-bottom:8px}
+.fast{display:flex;align-items:center;justify-content:center;gap:6px;margin-bottom:12px;font-size:12px;color:#6e6e73}
+.fast input{cursor:pointer}
 .st{font-size:13px;text-align:center;margin-bottom:10px;color:#6e6e73;min-height:20px}
 .st.e{color:#e68a00}
 
@@ -303,10 +305,11 @@ h1{font-size:22px;font-weight:600;margin-bottom:4px}
 <input type="file" id="fi" name="image" accept="image/*" multiple style="display:none">
 
 <button class="go" id="go">Run OCR</button>
+<label class="fast"><input type="checkbox" id="fast"> Fast mode (~3× faster, may miss text)</label>
 <div class="st" id="st"></div>
 </div>
 <script>
-var dz=document.getElementById('dz'),fi=document.getElementById('fi'),cnt=document.getElementById('cnt'),fl=document.getElementById('fl'),go=document.getElementById('go'),st=document.getElementById('st');
+var dz=document.getElementById('dz'),fi=document.getElementById('fi'),cnt=document.getElementById('cnt'),fl=document.getElementById('fl'),go=document.getElementById('go'),st=document.getElementById('st'),fast=document.getElementById('fast');
 var sel=[];var xhr;
 var exts=['png','jpg','jpeg','gif','bmp','tiff','tif','heic','webp'];
 dz.onclick=function(){fi.click()};
@@ -315,7 +318,7 @@ dz.ondragover=function(e){e.preventDefault();dz.classList.add('dragover')};
 dz.ondragleave=function(){dz.classList.remove('dragover')};
 dz.ondrop=function(e){e.preventDefault();dz.classList.remove('dragover');sel=[];for(var i=0;i<e.dataTransfer.files.length;i++)sel.push(e.dataTransfer.files[i]);listar()};
 function listar(){cnt.textContent=sel.length+' file(s)';fl.innerHTML='';var bad=0;for(var i=0;i<sel.length;i++){var n=sel[i].name;var e=n.split('.').pop().toLowerCase();if(exts.indexOf(e)<0)bad++}if(bad)st.textContent='⚠️ '+bad+' of '+sel.length+' file(s) have unsupported formats';else st.textContent='';st.className=bad?'st e':'st'}
-go.onclick=function(){if(!sel.length){st.className='st e';st.textContent='Select files first';return}st.className='st';st.textContent='Processing '+sel.length+' file(s)...';var t0=Date.now();var timer=setInterval(function(){var e=((Date.now()-t0)/1000).toFixed(1);st.textContent='⏱ '+e+'s  •  '+sel.length+' file(s)'},100);var fd=new FormData();for(var i=0;i<sel.length;i++)fd.append('image',sel[i]);xhr=new XMLHttpRequest();xhr.open('POST','/ocr',true);xhr.onload=function(){clearInterval(timer);if(xhr.status==200){document.write(xhr.responseText)}else{st.className='st e';st.textContent='Error'}};xhr.onerror=function(){clearInterval(timer);st.className='st e';st.textContent='Connection error'};xhr.send(fd)};
+go.onclick=function(){if(!sel.length){st.className='st e';st.textContent='Select files first';return}st.className='st';st.textContent='Processing '+sel.length+' file(s)...';var t0=Date.now();var timer=setInterval(function(){var e=((Date.now()-t0)/1000).toFixed(1);st.textContent='⏱ '+e+'s  •  '+sel.length+' file(s)'},100);var fd=new FormData();for(var i=0;i<sel.length;i++)fd.append('image',sel[i]);var url='/ocr'+(fast.checked?'?fast=1':'');xhr=new XMLHttpRequest();xhr.open('POST',url,true);xhr.onload=function(){clearInterval(timer);if(xhr.status==200){document.write(xhr.responseText)}else{st.className='st e';st.textContent='Error'}};xhr.onerror=function(){clearInterval(timer);st.className='st e';st.textContent='Connection error'};xhr.send(fd)};
 </script>
 </body></html>
 """
