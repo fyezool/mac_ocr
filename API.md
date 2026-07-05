@@ -68,6 +68,7 @@ Content-Type: multipart/form-data; boundary=<boundary>
 | Parameter | Value | Description |
 |-----------|-------|-------------|
 | `format` | `html` (default), `txt`, `json` | Response format |
+| `fast` | `1` | Use `.fast` recognition level (2-3x faster, may miss small/dense text). Omit or set to `0` for `.accurate` (default). |
 
 ### Response by Format
 
@@ -126,6 +127,12 @@ curl -X POST \
   -F "image=@photo1.png" \
   -F "image=@photo2.jpg" \
   "http://192.168.2.6:8080/ocr?format=json"
+
+# Fast mode (~2-3x faster, good for bulk processing)
+curl -X POST -F "image=@shot.png" "http://192.168.2.6:8080/ocr?fast=1"
+
+# Fast mode + JSON output (for scripting)
+curl -X POST -F "image=@shot.png" "http://192.168.2.6:8080/ocr?fast=1&format=json"
 ```
 
 ### Example (Python)
