@@ -1,0 +1,190 @@
+{
+  "research_dossier": {
+    "schema_version": "1.0",
+    "generated_date": "2026-07-05",
+    "query": "OCR performance (speed & accuracy) using Apple Vision framework/API accelerated by the Neural Engine (NPU) specifically on Apple M3 Pro",
+    "researcher_note": "IMPORTANT FINDING: No peer-reviewed or preprint paper was found whose stated primary objective is 'improve OCR speed/accuracy via Apple Vision API on the M3 Pro NPU' specifically. This exact intersection (proprietary Apple framework + one chip generation + OCR) is a product-engineering niche, not an established academic research line. The sources below are the closest available evidence, split into three tiers by relevance. Tier 3 items are included only to support inference/synthesis, not as direct evidence.",
+    "search_coverage": {
+      "queries_run": 4,
+      "sources_reviewed": 30,
+      "search_engines": ["web_search (general + arXiv-indexed)"],
+      "gap_identified": true
+    },
+    "sources": [
+      {
+        "id": "S1",
+        "tier": 1,
+        "relevance_score": 0.75,
+        "title": "Apple Neural Engine: Architecture, Programming, and Performance",
+        "authors": ["Spencer H. Bryngelson"],
+        "venue": "arXiv preprint",
+        "arxiv_id": "2606.22283",
+        "url": "https://arxiv.org/abs/2606.22283",
+        "publication_date": "2026-06-21",
+        "type": "architecture_reverse_engineering_paper",
+        "directly_about_ocr": false,
+        "directly_about_m3_pro": true,
+        "key_findings": [
+          "First detailed reverse-engineered account of the Apple Neural Engine (ANE), the fixed-function matrix accelerator in Apple SoCs since A11/M1.",
+          "Documents the datapath and roofline (throughput/energy bounds) of the ANE, the dispatch route below Core ML, compiler/on-disk program format, weight-compression scheme, kernel driver and firmware protocol.",
+          "Covers chip families A11-A18 and M1-M5 with per-chip capability tables; direct hardware measurements were done on M1 and M5 (M3 Pro covered via documented/predicted tables, not direct measurement).",
+          "Confirms a low-level 'direct route' to the ANE exists outside Core ML, callable from user space, but is undocumented and version-fragile -- explicitly flagged as unsuitable for shipping apps.",
+          "Establishes that Core ML remains the only supported path to the ANE for production software, which is the same path Apple's Vision framework uses internally for text recognition."
+        ],
+        "applicability_to_query": "This is the most directly relevant technical source for understanding *why* Vision-framework OCR is fast/efficient on M3 Pro: it explains the ANE's throughput/energy roofline that any Core ML-backed model (including VNRecognizeTextRequest's internal models) operates within. It does not benchmark OCR itself.",
+        "limitations": "Not an OCR paper. No M3 Pro-specific direct measurements (M3 Pro data is inferred/documented, not empirically measured in this paper). Very recent (June 2026), so independent replication is not yet available."
+      },
+      {
+        "id": "S2",
+        "tier": 1,
+        "relevance_score": 0.6,
+        "title": "On-Device OCR: RedNote's dots.ocr Model Ported to Apple's Neural Engine",
+        "authors": ["Christopher Fleetwood", "Pedro Cuenca"],
+        "venue": "Hugging Face technical blog series (industry report, not peer-reviewed)",
+        "url": "https://www.kukarella.com/news/on-device-ocr-rednotes-dotsocr-model-on-apples-neural-engine-p1759668825",
+        "publication_date": "2025-10-05",
+        "type": "engineering_case_study",
+        "directly_about_ocr": true,
+        "directly_about_m3_pro": false,
+        "key_findings": [
+          "Documents converting a 3B-parameter OCR model (dots.ocr: 1.2B vision encoder + LM backbone) from PyTorch to Core ML for execution on the Apple Neural Engine.",
+          "Reports the ANE is roughly 12x more power-efficient than CPU and 4x more power-efficient than GPU for this workload class.",
+          "Describes the two-stage PyTorch-to-Core ML conversion pipeline (graph capture, then compilation) as the main engineering bottleneck for getting OCR models onto the ANE.",
+          "Simplifying the model for single-image (vs. batch/video) processing was necessary to make on-device OCR practical."
+        ],
+        "applicability_to_query": "Directly relevant methodology (OCR + ANE conversion pipeline) but tests a third-party VLM-based OCR model, not Apple's native Vision API (VNRecognizeTextRequest), and does not isolate M3 Pro specifically.",
+        "limitations": "Not peer-reviewed. Power-efficiency figures are vendor/author-reported, not independently benchmarked. No accuracy/speed numbers on M3 Pro hardware specifically."
+      },
+      {
+        "id": "S3",
+        "tier": 1,
+        "relevance_score": 0.45,
+        "title": "Apple Vision Framework for OCR (community discussion/benchmark anecdote)",
+        "authors": ["community contributors, icereed/paperless-gpt repo"],
+        "venue": "GitHub Discussion #890",
+        "url": "https://github.com/icereed/paperless-gpt/discussions/890",
+        "publication_date": "undated (recent)",
+        "type": "practitioner_anecdote",
+        "directly_about_ocr": true,
+        "directly_about_m3_pro": false,
+        "key_findings": [
+          "Practitioner reports going from ~85-90% perceived accuracy with vision LLMs (via Ollama) to ~99% perceived accuracy after switching to Apple's native Vision Framework OCR, run on Apple Mac hardware (M4 Pro Mac mini, not M3 Pro).",
+          "Informal, non-rigorous accuracy claim (no formal test set, ground truth, or metric reported)."
+        ],
+        "applicability_to_query": "Useful as real-world qualitative signal that Apple's native Vision framework OCR outperforms generic VLM-based OCR pipelines in practice, but it is anecdotal, not a controlled study, and uses M4 Pro rather than M3 Pro.",
+        "limitations": "Not a research source. No methodology, no dataset, no statistical rigor. Different chip (M4 Pro)."
+      },
+      {
+        "id": "S4",
+        "tier": 2,
+        "relevance_score": 0.35,
+        "title": "Benchmarking On-Device Machine Learning on Apple Silicon with MLX",
+        "authors": ["Oluwaseun A. Ajayi", "et al."],
+        "venue": "arXiv preprint",
+        "arxiv_id": "2510.18921",
+        "url": "https://arxiv.org/abs/2510.18921",
+        "publication_date": "2025-10-21",
+        "type": "benchmarking_paper",
+        "directly_about_ocr": false,
+        "directly_about_m3_pro": false,
+        "key_findings": [
+          "Benchmarks transformer model inference latency on Apple Silicon MacBooks vs. NVIDIA CUDA GPU using the MLX framework.",
+          "Finds Apple Silicon devices offer competitive on-device inference performance despite CUDA leading in raw throughput.",
+          "Observes sub-linear scaling of inference time with batch size on Apple Silicon, suggesting good scalability for batch-style workloads (relevant if batch-processing multiple OCR images)."
+        ],
+        "applicability_to_query": "Not OCR-specific and does not use the Vision API/Core ML/ANE path (MLX targets GPU/unified memory, not the ANE) -- but useful as general context for Apple Silicon ML performance characteristics and methodology for benchmarking on M-series chips.",
+        "limitations": "Different execution backend (MLX/GPU, not Core ML/ANE) than what Vision framework OCR uses. No M3 Pro-specific isolated results confirmed. Not about OCR."
+      },
+      {
+        "id": "S5",
+        "tier": 2,
+        "relevance_score": 0.3,
+        "title": "Benchmarking and Characterization of Large Language Model Inference on Apple Silicon",
+        "authors": ["multiple authors"],
+        "venue": "Proceedings of the ACM on Measurement and Analysis of Computing Systems (peer-reviewed)",
+        "doi_url": "https://dl.acm.org/doi/10.1145/3771563",
+        "publication_date": "2025-12-02",
+        "type": "peer_reviewed_benchmarking_paper",
+        "directly_about_ocr": false,
+        "directly_about_m3_pro": false,
+        "key_findings": [
+          "Peer-reviewed, large-scale (5 hardware testbeds including 3 Apple M-series devices: M2 Ultra, M2 Max, M4 Pro) characterization of on-device LLM inference performance vs. NVIDIA GPUs.",
+          "Profiles low-level hardware metrics (ALU utilization, memory bandwidth, buffer usage, cache residency) to explain Apple Silicon's performance gaps/advantages.",
+          "Identifies unified memory architecture as a key differentiator for Apple Silicon on-device inference workloads."
+        ],
+        "applicability_to_query": "Rigorous, peer-reviewed methodology for profiling Apple Silicon ML performance that could be adapted to an OCR/Vision-API study, but covers LLMs on GPU, not OCR on the ANE, and does not include M3 Pro in its tested hardware set.",
+        "limitations": "No M3 Pro data. No OCR workload. No ANE/Core ML path tested (this is GPU-focused LLM inference)."
+      },
+      {
+        "id": "S6",
+        "tier": 3,
+        "relevance_score": 0.15,
+        "title": "ConsumerBench: Benchmarking Generative AI Applications on End-User Devices",
+        "authors": ["multiple authors"],
+        "venue": "arXiv preprint",
+        "url": "https://arxiv.org/pdf/2506.17538",
+        "type": "benchmarking_paper",
+        "directly_about_ocr": false,
+        "directly_about_m3_pro": false,
+        "key_findings": [
+          "Runs generative AI application benchmarks on a MacBook Pro with M1 Pro chip (32GB unified memory), monitoring GPU utilization and power via 'powermetrics'.",
+          "Notes Apple's closed hardware design limits externally observable metrics (e.g., no direct memory bandwidth utilization reporting)."
+        ],
+        "applicability_to_query": "Provides a usable methodology template (powermetrics-based profiling) for anyone wanting to build the missing M3 Pro + Vision API OCR benchmark study, but tests M1 Pro, not M3 Pro, and not OCR.",
+        "limitations": "Different chip generation (M1 Pro). Not OCR. Included only for methodology reference."
+      },
+      {
+        "id": "S7",
+        "tier": 3,
+        "relevance_score": 0.1,
+        "title": "Technical Analysis of Modern Non-LLM OCR Engines",
+        "venue": "IntuitionLabs technical report (industry, not peer-reviewed)",
+        "url": "https://intuitionlabs.ai/articles/non-llm-ocr-technologies",
+        "type": "industry_survey",
+        "directly_about_ocr": true,
+        "directly_about_m3_pro": false,
+        "key_findings": [
+          "Surveys non-LLM OCR engine architectures (Google Cloud Vision, Tesseract, PaddleOCR/SVTR, TrOCR) but does not cover Apple's Vision framework or the ANE at all."
+        ],
+        "applicability_to_query": "Background/context only, for comparing what OCR architecture families exist; does not mention Apple Vision API or M-series chips.",
+        "limitations": "No Apple-specific content. Included only as general OCR-architecture background."
+      }
+    ],
+    "synthesized_analysis": {
+      "confidence": "moderate-low (synthesized from adjacent sources, not a single authoritative study)",
+      "why_the_gap_exists": [
+        "Apple's Vision framework (VNRecognizeTextRequest) and its underlying OCR models are closed-source; researchers cannot instrument or modify the actual recognition network, which discourages academic study.",
+        "The ANE itself is only accessible through Core ML and is undocumented at the hardware/ISA level, so 'why is it fast on M3 Pro' questions require reverse engineering (as in S1) rather than standard profiling.",
+        "OCR benchmarking research has concentrated on cross-platform, open-weight models (PaddleOCR, TrOCR, VLM-based OCR) that can run on commodity GPUs and be fairly compared across vendors -- Apple's stack is a poor fit for that comparative research paradigm since it's single-vendor and closed."
+      ],
+      "inferred_technical_recommendations_for_speed_and_accuracy_on_m3_pro": [
+        {
+          "recommendation": "Use VNRecognizeTextRequest with recognitionLevel = .accurate for accuracy-critical tasks; this path is Core ML/ANE-backed and benefits from the ANE's power/throughput efficiency documented in S1.",
+          "basis": "S1 (ANE roofline characteristics), S2 (ANE efficiency multipliers), S3 (practitioner accuracy report)"
+        },
+        {
+          "recommendation": "Batch image requests where possible (e.g., VNImageRequestHandler per image but grouped processing) since Apple Silicon shows sub-linear latency scaling with batch size in adjacent ML workloads.",
+          "basis": "S4 (MLX batch scaling finding) -- extrapolated, not OCR-verified"
+        },
+        {
+          "recommendation": "Avoid custom Core ML OCR model conversion unless native Vision API is insufficient; the ANE conversion pipeline (graph capture + compile) is nontrivial engineering overhead per S2, and Apple's native Vision models are already ANE-optimized by Apple.",
+          "basis": "S2"
+        },
+        {
+          "recommendation": "If building a custom benchmark, use 'powermetrics' for power/GPU-ANE utilization profiling on M3 Pro, following the methodology pattern in S6, since Apple does not expose lower-level counters.",
+          "basis": "S6"
+        },
+        {
+          "recommendation": "For preprocessing, downsampling/cropping to text regions before calling VNRecognizeTextRequest reduces ANE workload and end-to-end latency -- consistent with general roofline/throughput-bound behavior described in S1.",
+          "basis": "S1 (roofline reasoning, not directly tested)"
+        }
+      ],
+      "research_gap_statement": "No controlled, reproducible study currently isolates Apple M3 Pro + Vision API/VNRecognizeTextRequest OCR performance (accuracy and latency) against a labeled OCR benchmark (e.g., ICDAR, OCRBench) with ANE-vs-GPU-vs-CPU ablation. This would be a novel and fillable research contribution."
+    },
+    "suggested_next_steps": [
+      "If academic-grade evidence is required, no further web search will surface it -- the gap is real, not a search failure. Options: (a) run your own benchmark on M3 Pro using VNRecognizeTextRequest against a standard OCR test set (e.g., ICDAR2015, FUNSD, or OCRBench) with .fast vs .accurate recognitionLevel, CPU/GPU/ANE forced execution via MLComputeUnits, and report latency + character/word error rate; (b) treat S1 + S2 + S6 as your citation base for 'why', and present your own benchmark as the 'what' data.",
+      "Consider Apple's own WWDC engineering sessions on Vision framework (not academic papers, but authoritative primary documentation on capabilities/limits) as a supplementary non-academic source.",
+      "Re-run this search periodically -- S1 (ANE architecture paper) was published June 2026, indicating growing interest in ANE internals; a dedicated OCR-on-ANE benchmarking paper could plausibly appear within the next 6-12 months."
+    ]
+  }
+}
