@@ -75,8 +75,9 @@ final class ServerManager: NSObject, @unchecked Sendable {
         guard buf.count > 0 else { Darwin.close(fd); return }
         let start = CFAbsoluteTimeGetCurrent()
         guard let req = Req(buf) else { sendAndClose(fd, 400, "Bad Request", "text/plain"); return }
+        let fmt = parseFormat(from: req.path)
 
-        switch (req.method, req.path) {
+        switch (req.method, req.path.components(separatedBy: "?").first ?? req.path) {
         case ("GET", "/"):
             sendAndClose(fd, 200, webHTML, "text/html; charset=utf-8")
             log("GET", "/", ip, "", 0, 200)
@@ -84,7 +85,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
             sendAndClose(fd, 200, "{\"status\":\"ok\",\"address\":\"\(address):\(port)\"}", "application/json")
             log("GET", "/health", ip, "", 0, 200)
         case ("POST", "/ocr"):
-            handleOCR(fd, req, ip, start)  // async — fd closed in the Task
+            handleOCR(fd, req, ip, start, format: fmt)
         case ("OPTIONS", _):
             sendAndClose(fd, 204, "", "text/plain")
         default:
@@ -92,11 +93,21 @@ final class ServerManager: NSObject, @unchecked Sendable {
         }
     }
 
+    private func parseFormat(from path: String) -> String {
+        guard let q = path.firstIndex(of: "?") else { return "html" }
+        let query = String(path[q...].dropFirst())
+        for pair in query.components(separatedBy: "&") {
+            let kv = pair.components(separatedBy: "=")
+            if kv.count == 2, kv[0] == "format" { return kv[1].lowercased() }
+        }
+        return "html"
+    }
+
     private func sendAndClose(_ fd: Int32, _ status: Int, _ body: String, _ ct: String) {
         send(fd, status, body, ct); Darwin.close(fd)
     }
 
-    private func handleOCR(_ fd: Int32, _ req: Req, _ ip: String, _ start: CFAbsoluteTime) {
+    private func handleOCR(_ fd: Int32, _ req: Req, _ ip: String, _ start: CFAbsoluteTime, format: String = "html") {
         guard let b = req.boundary else { sendAndClose(fd, 400, "{\"success\":false,\"error\":\"Expected multipart\"}", "application/json"); return }
         let files = parseMultiAll(req.body, b)
         guard !files.isEmpty else { sendAndClose(fd, 400, "{\"success\":false,\"error\":\"No image\"}", "application/json"); return }
@@ -121,7 +132,25 @@ final class ServerManager: NSObject, @unchecked Sendable {
         let el = CFAbsoluteTimeGetCurrent() - start
         let results = allResults.isEmpty ? files.map { OCRItem(filename: $0.name, text: "", error: "No result", duration: 0) } : allResults
 
-        // Build HTML results page with dropdown
+        // Handle format selection
+        if format == "txt" {
+            var txt = ""
+            for r in results {
+                txt += "--- \(r.filename) ---\n\(r.text ?? "")\n\n"
+            }
+            sendAndClose(fd, 200, txt, "text/plain; charset=utf-8")
+            log("POST", "/ocr", ip, "\(results.count) files", el, 200)
+            return
+        }
+        if format == "json" {
+            let resp = BatchOCRResponse(results: results, server_duration_seconds: el)
+            let json = ((try? JSONEncoder().encode(resp)).flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
+            sendAndClose(fd, 200, json, "application/json")
+            log("POST", "/ocr", ip, "\(results.count) files", el, 200)
+            return
+        }
+
+        // Build HTML results page (default)
         var optRows = ""
         var firstText = ""
         for (i, r) in results.enumerated() {
