@@ -42,9 +42,32 @@ enum OCRService {
 
             do {
                 let observations = try await request.perform(on: imageData)
-                recognizedText = observations
-                    .compactMap { $0.topCandidates(1).first?.string }
-                    .joined(separator: "\n")
+                // Group observations by line/paragraph using bounding boxes
+                // Sort top-to-bottom, left-to-right
+                let sorted = observations.sorted(by: { a, b in
+                    let aBox = a.boundingBox
+                    let bBox = b.boundingBox
+                    let aY = aBox.origin.y + aBox.height / 2
+                    let bY = bBox.origin.y + bBox.height / 2
+                    if abs(aY - bY) > 0.02 { return aY > bY }
+                    return aBox.origin.x < bBox.origin.x
+                })
+                var lines: [String] = []
+                var lastY: CGFloat = -1
+                for obs in sorted {
+                    let text = obs.topCandidates(1).first?.string ?? ""
+                    let centerY = obs.boundingBox.origin.y + obs.boundingBox.height / 2
+                    if lastY > 0, abs(centerY - lastY) > 0.03 {
+                        lines.append("")
+                    }
+                    if lines.isEmpty || abs(centerY - lastY) > 0.02 {
+                        lines.append(text)
+                    } else {
+                        lines[lines.count - 1] += " " + text
+                    }
+                    lastY = centerY
+                }
+                recognizedText = lines.joined(separator: "\n")
             } catch {
                 let elapsed = CFAbsoluteTimeGetCurrent() - start
                 results.append(OCRItem(

@@ -7,11 +7,14 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		C001000028 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000029 /* main.swift */; };
-		AC001000001 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000006 /* AppDelegate.swift */; };
+		C001000001 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000006 /* AppDelegate.swift */; };
 		C001000002 /* ViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000007 /* ViewController.swift */; };
 		C001000003 /* OCRService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000008 /* OCRService.swift */; };
 		C001000016 /* ServerManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000017 /* ServerManager.swift */; };
+		C001000021 /* View+BuildUI.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000020 /* View+BuildUI.swift */; };
+		C001000023 /* View+Layout.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000022 /* View+Layout.swift */; };
+		C001000025 /* View+Actions.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000024 /* View+Actions.swift */; };
+		C001000027 /* View+Table.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000026 /* View+Table.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -22,7 +25,10 @@
 		C001000008 /* OCRService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OCRService.swift; sourceTree = "<group>"; };
 		C001000017 /* ServerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerManager.swift; sourceTree = "<group>"; };
 		C001000019 /* ServerViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerViewController.swift; sourceTree = "<group>"; };
-		C001000029 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		C001000020 /* View+BuildUI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "View+BuildUI.swift"; sourceTree = "<group>"; };
+		C001000022 /* View+Layout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "View+Layout.swift"; sourceTree = "<group>"; };
+		C001000024 /* View+Actions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "View+Actions.swift"; sourceTree = "<group>"; };
+		C001000026 /* View+Table.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "View+Table.swift"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -48,12 +54,15 @@
 			isa = PBXGroup;
 			children = (
 				C001000005 /* Info.plist */,
-				C001000029 /* main.swift */,
 				C001000006 /* AppDelegate.swift */,
 				C001000007 /* ViewController.swift */,
 				C001000008 /* OCRService.swift */,
 				C001000017 /* ServerManager.swift */,
-											);
+				C001000020 /* View+BuildUI.swift */,
+				C001000022 /* View+Layout.swift */,
+				C001000024 /* View+Actions.swift */,
+				C001000026 /* View+Table.swift */,
+			);
 			path = "OCR-App";
 			sourceTree = "<group>";
 		};
@@ -117,11 +126,14 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AC001000001 /* AppDelegate.swift in Sources */,
+				C001000001 /* AppDelegate.swift in Sources */,
 				C001000002 /* ViewController.swift in Sources */,
 				C001000003 /* OCRService.swift in Sources */,
 				C001000016 /* ServerManager.swift in Sources */,
-												C001000028 /* main.swift in Sources */,
+				C001000021 /* View+BuildUI.swift in Sources */,
+				C001000023 /* View+Layout.swift in Sources */,
+				C001000025 /* View+Actions.swift in Sources */,
+				C001000027 /* View+Table.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -147,7 +159,7 @@
 					"$(inherited)",
 				);
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = macosx;
@@ -170,7 +182,7 @@
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_OPTIMIZATION_LEVEL = s;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
-				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				SDKROOT = macosx;
 				SWIFT_COMPILATION_MODE = wholemodule;
@@ -195,7 +207,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.ocr.batch-processor";
 				PRODUCT_NAME = "OCR App";
@@ -220,7 +232,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "com.ocr.batch-processor";
 				PRODUCT_NAME = "OCR App";
