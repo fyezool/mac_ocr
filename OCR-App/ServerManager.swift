@@ -5,6 +5,19 @@ import Darwin
 import Glibc
 #endif
 
+// MARK: - Client Tracking
+
+struct ConnectedClient: Identifiable, Sendable {
+    let id: UUID
+    let ip: String
+    let connectedAt: Date
+    let path: String
+    let isActive: Bool
+    let duration: TimeInterval
+
+    var label: String { isActive ? "active" : "done" }
+}
+
 // MARK: - Server Event
 struct ServerLogEntry: Sendable {
     let id: UUID; let method: String; let path: String; let remote: String
@@ -20,6 +33,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
     private let logLock = NSLock()
     var onStatusChange: ((Bool, String) -> Void)?
     var onNewLogEntry: ((ServerLogEntry) -> Void)?
+    var onClientsChanged: (([ConnectedClient]) -> Void)?
     var isRunning: Bool { running }
     var port: UInt16 = 8080
     private(set) var address: String = "127.0.0.1"
@@ -27,6 +41,45 @@ final class ServerManager: NSObject, @unchecked Sendable {
     var recentLog: [ServerLogEntry] {
         logLock.lock(); defer { logLock.unlock() }
         return Array(logEntries.suffix(20))
+    }
+
+    // Client tracking
+    private var activeClients: [Int32: ConnectedClient] = [:]
+    private var completedClients: [ConnectedClient] = []
+    private let clientLock = NSLock()
+    var connectedClients: [ConnectedClient] {
+        clientLock.lock(); defer { clientLock.unlock() }
+        return Array(activeClients.values) + completedClients
+    }
+
+    private func trackClient(_ fd: Int32, ip: String) {
+        let c = ConnectedClient(id: UUID(), ip: ip, connectedAt: Date(), path: "", isActive: true, duration: 0)
+        clientLock.lock(); activeClients[fd] = c; clientLock.unlock()
+        DispatchQueue.main.async { self.onClientsChanged?(self.connectedClients) }
+    }
+
+    private func updateClientPath(_ fd: Int32, path: String) {
+        clientLock.lock()
+        if var c = activeClients[fd] {
+            c = ConnectedClient(id: c.id, ip: c.ip, connectedAt: c.connectedAt, path: path, isActive: true, duration: c.duration)
+            activeClients[fd] = c
+        }
+        clientLock.unlock()
+    }
+
+    private func untrackClient(_ fd: Int32) {
+        let elapsed: TimeInterval
+        let client: ConnectedClient?
+        clientLock.lock()
+        client = activeClients.removeValue(forKey: fd)
+        elapsed = client.map { Date().timeIntervalSince($0.connectedAt) } ?? 0
+        if var c = client {
+            c = ConnectedClient(id: c.id, ip: c.ip, connectedAt: c.connectedAt, path: c.path, isActive: false, duration: elapsed)
+            completedClients.append(c)
+            if completedClients.count > 20 { completedClients.removeFirst(completedClients.count - 20) }
+        }
+        clientLock.unlock()
+        DispatchQueue.main.async { self.onClientsChanged?(self.connectedClients) }
     }
 
     func start(port: UInt16 = 8080) {
@@ -60,7 +113,8 @@ final class ServerManager: NSObject, @unchecked Sendable {
             var fl = fcntl(cf, F_GETFL, 0); fcntl(cf, F_SETFL, fl | O_NONBLOCK)
             let ip = String(cString: inet_ntoa(ca.sin_addr))
             guard let srv = self else { Darwin.close(cf); break }
-            srv.queue.async { srv.handle(cf, ip: ip) }
+            srv.trackClient(cf, ip: ip)
+            srv.queue.async { srv.handle(cf, ip: ip); srv.untrackClient(cf) }
         } }
         source?.setCancelHandler { Darwin.close(fd) }
         source?.resume()
@@ -84,6 +138,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         guard buf.count > 0 else { Darwin.close(fd); return }
         let start = CFAbsoluteTimeGetCurrent()
         guard let req = Req(buf) else { sendAndClose(fd, 400, "Bad Request", "text/plain"); return }
+        updateClientPath(fd, path: req.path)
         let fmt = parseFormat(from: req.path)
         let isFast = req.path.contains("?fast=1") || req.path.contains("&fast=1")
 
@@ -141,6 +196,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
 
         let el = CFAbsoluteTimeGetCurrent() - start
         let results = allResults.isEmpty ? files.map { OCRItem(filename: $0.name, text: "", error: "No result", duration: 0) } : allResults
+        let totalDuration = results.reduce(0.0) { $0 + $1.duration }
 
         // Handle format selection
         if format == "txt" {
@@ -174,7 +230,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         }
 
         let jsonData = ((try? JSONEncoder().encode(results)).flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
-        let html = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>OCR Results</title><style>:root{--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--secondary:#6e6e73;--tertiary:#aeaeb2;--border:#c7c7cc;--accent:#007aff;--accent-hover:#0066d6;--shadow:rgba(0,0,0,0.08);--out-bg:#f5f5f7;--out-border:#e5e5ea}@media(prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--text:#f5f5f7;--secondary:#98989d;--tertiary:#636366;--border:#38383a;--accent:#0a84ff;--accent-hover:#409cff;--shadow:rgba(0,0,0,0.3);--out-bg:#3a3a3c;--out-border:#48484a}}*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Display\",\"SF Pro Text\",\"Helvetica Neue\",sans-serif;background:var(--bg);color:var(--text);padding:40px 20px;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;transition:background 0.3s ease}.card{background:var(--card);border-radius:20px;padding:32px;max-width:620px;width:100%;box-shadow:0 4px 24px var(--shadow);transition:background 0.3s ease}h1{font-size:24px;font-weight:700;letter-spacing:-0.02em;margin-bottom:2px}.meta{color:var(--secondary);font-size:13px;margin-bottom:20px;display:flex;align-items:center;gap:6px}.actions{display:flex;gap:8px;margin-bottom:16px}.actions button,.actions a{padding:10px 20px;border-radius:10px;font-size:13px;font-weight:500;text-decoration:none;text-align:center;flex:1;border:none;cursor:pointer;transition:all 0.2s ease;font-family:inherit}.actions .primary{background:var(--accent);color:#fff}.actions .primary:hover{background:var(--accent-hover)}.actions .secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.actions .secondary:hover{background:var(--out-bg)}select{width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:10px;font-size:14px;background:var(--card);color:var(--text);margin-bottom:14px;appearance:auto;transition:border-color 0.2s ease}.out{background:var(--out-bg);border:1px solid var(--out-border);border-radius:12px;padding:18px;min-height:160px;font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word;transition:background 0.3s ease,border-color 0.3s ease}.err{color:var(--warning,#ff9500);font-size:12px;margin-top:6px;min-height:18px}.footer{margin-top:20px;padding-top:16px;border-top:1px solid var(--border);font-size:12px;color:var(--tertiary);text-align:center}</style></head><body><div class=\"card\"><h1>📄 Results</h1><p class=\"meta\"><span>" + String(results.count) + " file(s)</span><span>•</span><span>⏱ " + String(format: "%.1f", el) + "s</span></p><div class=\"actions\"><button class=\"primary\" id=\"sv\">💾 Save All</button><button class=\"secondary\" id=\"cp\">📋 Copy</button><a class=\"secondary\" href=\"/\">✕ Clear</a></div><div class=\"err\" id=\"err\"></div><select id=\"sel\" onchange=\"show()\">" + optRows + "</select><div class=\"out\" id=\"out\">" + firstText + "</div></div><script>var d=" + jsonData + ";function show(){var s=document.getElementById('sel');var i=s.selectedIndex;if(d&&i>=0&&i<d.length){document.getElementById('out').textContent=d[i].text||'(no text)';document.getElementById('err').textContent=d[i].error?'⚠️ '+d[i].error:''}}document.getElementById('sv').onclick=function(){var t='';for(var i=0;i<d.length;i++){t+='--- '+d[i].filename+' ---\\n'+(d[i].text||'(no text)')+'\\n\\n'}var a=document.createElement('a');a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(t);a.download='ocr_results.txt';a.click()};document.getElementById('cp').onclick=function(){var s=document.getElementById('sel');var i=s.selectedIndex;if(d&&i>=0&&i<d.length){navigator.clipboard.writeText(d[i].text||'')}}</script></body></html>"
+        let html = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>OCR Results</title><style>:root{--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--secondary:#6e6e73;--tertiary:#aeaeb2;--border:#c7c7cc;--accent:#007aff;--accent-hover:#0066d6;--shadow:rgba(0,0,0,0.08);--out-bg:#f5f5f7;--out-border:#e5e5ea}@media(prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--text:#f5f5f7;--secondary:#98989d;--tertiary:#636366;--border:#38383a;--accent:#0a84ff;--accent-hover:#409cff;--shadow:rgba(0,0,0,0.3);--out-bg:#3a3a3c;--out-border:#48484a}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:0.01ms!important;transition-duration:0.01ms!important}}*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Display\",\"SF Pro Text\",\"Helvetica Neue\",sans-serif;background:var(--bg);color:var(--text);padding:40px 20px;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;-webkit-tap-highlight-color:transparent}.card{background:var(--card);border-radius:20px;padding:32px;max-width:620px;width:100%;box-shadow:0 4px 24px var(--shadow)}h1{font-size:24px;font-weight:700;letter-spacing:-0.02em;margin-bottom:2px}.meta{color:var(--secondary);font-size:13px;margin-bottom:20px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}.actions{display:flex;gap:8px;margin-bottom:16px}.actions button,.actions a{padding:10px 20px;border-radius:10px;font-size:13px;font-weight:500;text-decoration:none;text-align:center;flex:1;border:none;cursor:pointer;transition:all 0.2s ease;font-family:inherit}.actions button:focus-visible,.actions a:focus-visible{box-shadow:0 0 0 3px rgba(0,122,255,0.4)}.actions .primary{background:var(--accent);color:#fff}.actions .primary:hover{background:var(--accent-hover)}.actions .secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.actions .secondary:hover{background:var(--out-bg)}select{width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:10px;font-size:14px;background:var(--card);color:var(--text);margin-bottom:14px;appearance:auto}select:focus-visible{box-shadow:0 0 0 3px rgba(0,122,255,0.4)}.out{background:var(--out-bg);border:1px solid var(--out-border);border-radius:12px;padding:18px;min-height:160px;font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word}.err{color:#ff9500;font-size:12px;margin-top:6px;min-height:18px}.t{color:var(--tertiary);font-size:12px}.footer{margin-top:20px;padding-top:16px;border-top:1px solid var(--border);font-size:12px;color:var(--tertiary);text-align:center}</style></head><body><main><div class=\"card\"><h1>📄 Results</h1><p class=\"meta\"><span>" + String(results.count) + " file(s)</span><span>•</span><span>⏱ " + String(format: "%.1f", el) + "s wall</span><span class=\"t\">• " + String(format: "%.1f", totalDuration) + "s processing</span></p><div class=\"actions\"><button class=\"primary\" id=\"sv\">💾 Save All</button><button class=\"secondary\" id=\"cp\">📋 Copy</button><a class=\"secondary\" href=\"/\">✕ Clear</a></div><div class=\"err\" id=\"err\" aria-live=\"polite\" role=\"status\"></div><label for=\"sel\" class=\"sr-only\" style=\"position:absolute;width:1px;height:1px;overflow:hidden\">Select a file</label><select id=\"sel\" onchange=\"show()\">" + optRows + "</select><div class=\"out\" id=\"out\">" + firstText + "</div><div class=\"footer\">OCR Batch Processor</div></div></main><script>(function(){const d=" + jsonData + ";const sel=document.getElementById('sel'),out=document.getElementById('out'),err=document.getElementById('err');function show(){const i=sel.selectedIndex;if(d&&i>=0&&i<d.length){out.textContent=d[i].text||'(no text)';err.textContent=d[i].error?'⚠️ '+d[i].error:''}}window.show=show;document.getElementById('sv').onclick=function(){let t='';for(const r of d){t+='--- '+r.filename+' ---\\n'+(r.text||'(no text)')+'\\n\\n'}const a=document.createElement('a');a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(t);a.download='ocr_results.txt';a.click()};document.getElementById('cp').onclick=function(){const i=sel.selectedIndex;if(d&&i>=0&&i<d.length){navigator.clipboard.writeText(d[i].text||'')}};if(d&&d.length)show()})();</script></body></html>"
 
         sendAndClose(fd, 200, html, "text/html; charset=utf-8")
         log("POST", "/ocr", ip, "\(results.count) files", el, 200)
@@ -297,7 +353,7 @@ private let webHTML = """
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
 <title>OCR</title>
 <style>
   :root {
@@ -314,9 +370,9 @@ private let webHTML = """
     --drop-bg: #ffffff;
     --drop-hover-bg: #f0f7ff;
     --drop-hover-border: #007aff;
-    --success: #34c759;
     --warning: #ff9500;
     --error: #ff3b30;
+    --focus-ring: rgba(0,122,255,0.4);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -333,7 +389,11 @@ private let webHTML = """
       --drop-bg: #2c2c2e;
       --drop-hover-bg: #1a2f44;
       --drop-hover-border: #0a84ff;
+      --focus-ring: rgba(10,132,255,0.4);
     }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,*::before,*::after{animation-duration:0.01ms!important;transition-duration:0.01ms!important}
   }
   *{box-sizing:border-box;margin:0;padding:0}
   body{
@@ -341,32 +401,31 @@ private let webHTML = """
     background:var(--bg);color:var(--text);padding:40px 20px;
     display:flex;justify-content:center;align-items:flex-start;min-height:100vh;
     -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
-    transition:background 0.3s ease,color 0.3s ease;
+    -webkit-tap-highlight-color:transparent;
   }
   .card{
     background:var(--card);border-radius:20px;padding:32px;
     max-width:560px;width:100%;
     box-shadow:0 4px 24px var(--shadow);
-    transition:background 0.3s ease,box-shadow 0.3s ease;
   }
   h1{font-size:24px;font-weight:700;letter-spacing:-0.02em;margin-bottom:4px}
   .sub{color:var(--secondary);font-size:14px;margin-bottom:24px;line-height:1.4}
 
-  /* Drop Zone */
+  /* Drop Zone — drag only, no click picker */
   .zone{
     border:2px dashed var(--drop-border);border-radius:16px;
     padding:36px 24px;text-align:center;margin-bottom:20px;
-    cursor:pointer;background:var(--drop-bg);
+    background:var(--drop-bg);
     transition:all 0.25s ease;position:relative;
   }
-  .zone:hover,.zone.dragover{
+  .zone.dragover{
     border-color:var(--drop-hover-border);
     background:var(--drop-hover-bg);
     transform:scale(1.01);
   }
-  .zone-icon{font-size:40px;display:block;margin-bottom:12px;opacity:0.7}
-  .zone p{color:var(--secondary);font-size:14px;line-height:1.5}
-  .zone .hint{font-size:12px;color:var(--tertiary);margin-top:6px}
+  .zone-icon{font-size:40px;display:block;margin-bottom:12px;opacity:0.7;pointer-events:none}
+  .zone p{color:var(--secondary);font-size:14px;line-height:1.5;pointer-events:none}
+  .zone .hint{font-size:12px;color:var(--tertiary);margin-top:6px;pointer-events:none}
 
   /* Button */
   .btn{
@@ -375,11 +434,11 @@ private let webHTML = """
     cursor:pointer;text-align:center;
     background:var(--accent);color:#fff;
     transition:all 0.2s ease;
-    -webkit-font-smoothing:antialiased;
   }
   .btn:hover{background:var(--accent-hover);transform:translateY(-1px)}
   .btn:active{transform:translateY(0);opacity:0.9}
   .btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
+  .btn:focus-visible{box-shadow:0 0 0 3px var(--focus-ring)}
 
   /* Fast toggle */
   .fast-row{
@@ -391,92 +450,104 @@ private let webHTML = """
   }
   .fast-row label{cursor:pointer;user-select:none}
 
-  /* Status */
+  /* Status & Spinner */
   .st{
     font-size:13px;text-align:center;margin-top:14px;
     color:var(--secondary);min-height:22px;
     transition:color 0.2s ease;
   }
   .st.e{color:var(--warning);font-weight:500}
-
-  /* Loading spinner */
   .spinner{display:none;width:20px;height:20px;margin:0 auto 8px;
     border:2.5px solid var(--border);border-top-color:var(--accent);
     border-radius:50%;animation:spin 0.8s linear infinite}
   @keyframes spin{to{transform:rotate(360deg)}}
   .loading .spinner{display:block}
+
+  /* Screen-reader only */
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 </style></head>
 <body>
+<main>
 <div class="card">
   <h1>📄 OCR</h1>
   <p class="sub">Upload images to extract text</p>
 
-  <div class="zone" id="dz">
-    <span class="zone-icon">📁</span>
-    <p>Choose images or drag &amp; drop here</p>
-    <p class="hint">PNG, JPG, GIF, BMP, TIFF, HEIC, WebP</p>
-    <div id="cnt" style="font-size:13px;font-weight:600;margin-top:10px;color:var(--accent)"></div>
-  </div>
-  <input type="file" id="fi" name="image" accept="image/png,image/jpeg,image/gif,image/bmp,image/tiff,image/heic,image/webp" multiple style="display:none">
+  <form method="POST" action="/ocr" enctype="multipart/form-data" id="ocr-form">
+    <div class="zone" id="dz">
+      <span class="zone-icon" aria-hidden="true">📁</span>
+      <p>Drag &amp; drop images here</p>
+      <p class="hint">PNG, JPG, GIF, BMP, TIFF, HEIC, WebP</p>
+      <div id="cnt" aria-live="polite" style="font-size:13px;font-weight:600;margin-top:10px;color:var(--accent)"></div>
+    </div>
 
-  <button class="btn" id="go">Run OCR</button>
-  <div class="fast-row">
-    <input type="checkbox" id="fast">
-    <label for="fast">Fast mode (~3× faster, may miss text)</label>
-  </div>
-  <div class="st" id="st"></div>
-  <div class="spinner" id="spinner"></div>
+    <button class="btn" id="go" type="submit">Run OCR</button>
+    <div class="fast-row">
+      <input type="checkbox" id="fast" name="fast" value="1">
+      <label for="fast">Fast mode (~3× faster, may miss text)</label>
+    </div>
+    <div class="st" id="st" role="status" aria-live="polite"></div>
+    <div class="spinner" id="spinner" aria-hidden="true"></div>
+  </form>
 </div>
+</main>
 <script>
 (function(){
-  var dz=document.getElementById('dz'),fi=document.getElementById('fi'),
-      cnt=document.getElementById('cnt'),go=document.getElementById('go'),
-      st=document.getElementById('st'),fast=document.getElementById('fast'),
-      sp=document.getElementById('spinner');
-  var sel=[];
-  var exts=['png','jpg','jpeg','gif','bmp','tiff','tif','heic','webp'];
+  const dz=document.getElementById('dz'),
+        cnt=document.getElementById('cnt'),go=document.getElementById('go'),
+        st=document.getElementById('st'),fast=document.getElementById('fast'),
+        sp=document.getElementById('spinner'),form=document.getElementById('ocr-form');
+  let sel=[];
+  const exts=new Set(['png','jpg','jpeg','gif','bmp','tiff','tif','heic','webp']);
 
-  dz.onclick=function(){fi.click()};
-  fi.onchange=function(){sel=[];for(var i=0;i<fi.files.length;i++)sel.push(fi.files[i]);listar()};
+  // Drag only — no click picker
+  dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover')},{passive:false});
+  dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
+  dz.addEventListener('drop',e=>{
+    e.preventDefault();
+    dz.classList.remove('dragover');
+    if(e.dataTransfer?.files.length){sel=[...e.dataTransfer.files];updateCounter()}
+  });
 
-  dz.ondragover=function(e){e.preventDefault();dz.classList.add('dragover')};
-  dz.ondragleave=function(){dz.classList.remove('dragover')};
-  dz.ondrop=function(e){e.preventDefault();dz.classList.remove('dragover');
-    sel=[];for(var i=0;i<e.dataTransfer.files.length;i++)sel.push(e.dataTransfer.files[i]);listar()};
-
-  function listar(){
-    if(!sel.length){cnt.textContent='';return}
+  function updateCounter(){
+    if(!sel.length){cnt.textContent='';st.textContent='';st.className='st';return}
     cnt.textContent=sel.length+' file(s) selected';
-    var bad=0;
-    for(var i=0;i<sel.length;i++){
-      var n=sel[i].name,e=n.split('.').pop().toLowerCase();
-      if(exts.indexOf(e)<0)bad++
-    }
+    const bad=sel.filter(f=>!exts.has(f.name.split('.').pop().toLowerCase())).length;
     if(bad){st.textContent='⚠️ '+bad+' of '+sel.length+' file(s) have unsupported formats';st.className='st e'}
     else{st.textContent='';st.className='st'}
   }
 
-  go.onclick=function(){
+  // Intercept form submit for AJAX with live timer
+  form.addEventListener('submit',function(e){
+    e.preventDefault();
     if(!sel.length){st.className='st e';st.textContent='Select files first';return}
-    st.className='st';var t0=Date.now();
+
+    st.className='st';
+    const t0=Date.now();
     sp.style.display='block';
-    var timer=setInterval(function(){
+    go.disabled=true;
+
+    const timer=setInterval(()=>{
       st.textContent='⏱ '+((Date.now()-t0)/1000).toFixed(1)+'s  •  '+sel.length+' file(s)'
     },100);
-    var fd=new FormData();
-    for(var i=0;i<sel.length;i++)fd.append('image',sel[i]);
-    var url='/ocr'+(fast.checked?'?fast=1':'');
-    var xhr=new XMLHttpRequest();
-    xhr.open('POST',url,true);
-    xhr.onload=function(){
-      clearInterval(timer);sp.style.display='none';
-      if(xhr.status==200){document.write(xhr.responseText)}
-      else{st.className='st e';st.textContent='Error: server returned '+xhr.status}
-    };
-    xhr.onerror=function(){clearInterval(timer);sp.style.display='none';
-      st.className='st e';st.textContent='Connection error — is the server running?'};
-    xhr.send(fd)
-  };
+
+    const fd=new FormData();
+    for(const f of sel)fd.append('image',f);
+    const url='/ocr'+(fast.checked?'?fast=1':'');
+
+    fetch(url,{method:'POST',body:fd})
+      .then(r=>{
+        if(!r.ok)throw new Error('Server returned '+r.status);
+        return r.text()
+      })
+      .then(html=>{
+        clearInterval(timer);sp.style.display='none';go.disabled=false;
+        document.open();document.write(html);document.close()
+      })
+      .catch(err=>{
+        clearInterval(timer);sp.style.display='none';go.disabled=false;
+        st.className='st e';st.textContent='Error: '+err.message
+      })
+  });
 })();
 </script>
 </body>

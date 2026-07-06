@@ -32,19 +32,6 @@ final class OCRViewModel: ObservableObject {
 
     // MARK: - Actions
 
-    func pickImages() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = true
-        panel.allowedContentTypes = [
-            .png, .jpeg, .gif, .bmp, .tiff,
-            UTType(filenameExtension: "heic") ?? .image,
-            UTType(filenameExtension: "webp") ?? .image
-        ]
-        guard panel.runModal() == .OK else { return }
-        addURLs(panel.urls)
-    }
-
     func addURLs(_ urls: [URL]) {
         guard !isBusy else { return }
         var all: [URL] = []
@@ -83,7 +70,11 @@ final class OCRViewModel: ObservableObject {
         let fast = isFastMode
 
         Task {
-            let r = await OCRService.recognizeText(paths: paths, fast: fast)
+            var config = OCRConfiguration.default
+            if fast { config.recognitionLevel = .fast }
+            config.automaticallyDetectsLanguage = true
+            config.customWords = ["OCR", "Apple", "Vision", "Neural Engine"]
+            let r = await OCRService.recognizeText(paths: paths, config: config)
             await MainActor.run {
                 timer?.invalidate()
                 timer = nil

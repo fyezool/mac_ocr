@@ -5,38 +5,23 @@ import UniformTypeIdentifiers
 
 struct OCRTabView: View {
     @EnvironmentObject private var app: OCRViewModel
-    @State private var showDropTarget = false
     @State private var isHovering = false
-    @State private var dropProgress: [Progress] = []
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                // MARK: - File picker area
-                pickerSection
-
-                // MARK: - Info & controls
-                if app.hasFiles {
-                    infoSection
-                    controlsSection
-                }
-
-                // MARK: - Progress
                 if app.isBusy {
                     progressSection
                 }
 
-                // MARK: - Error
                 if app.hasError, let err = app.errorMessage {
                     errorSection(err)
                 }
 
-                // MARK: - Results
                 if app.hasResults {
                     resultsSection
                 }
 
-                // MARK: - Empty state
                 if !app.hasFiles && !app.hasResults && !app.hasError {
                     emptyState
                 }
@@ -53,60 +38,6 @@ struct OCRTabView: View {
             dropTargetOverlay
                 .opacity(isHovering ? 1 : 0)
                 .animation(.easeInOut(duration: 0.2), value: isHovering)
-        }
-        }
-
-    // MARK: - Picker
-
-    private var pickerSection: some View {
-        HStack(spacing: 12) {
-            Button(action: { app.pickImages() }) {
-                Label("Select Images or Folders", systemImage: "plus")
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-
-            if app.hasFiles {
-                Button("Clear", role: .destructive) {
-                    app.clearAll()
-                }
-                .buttonStyle(.bordered)
-            }
-        }
-    }
-
-    // MARK: - Info
-
-    private var infoSection: some View {
-        HStack {
-            Label("\(app.fileCount) file(s) selected", systemImage: "doc.on.doc")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            Spacer()
-        }
-        .padding(12)
-        .background(.fill.quaternary)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    // MARK: - Controls
-
-    private var controlsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 12) {
-                Button(action: { app.runOCR() }) {
-                    Label("Run OCR", systemImage: "text.magnifyingglass")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(app.isBusy)
-
-                Toggle(isOn: $app.isFastMode) {
-                    Text("Fast mode (~3× faster, may miss text)")
-                        .font(.caption)
-                }
-                .toggleStyle(.checkbox)
-            }
         }
     }
 
@@ -148,7 +79,6 @@ struct OCRTabView: View {
 
     private var resultsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Header
             HStack {
                 Text("Results")
                     .font(.headline)
@@ -165,7 +95,22 @@ struct OCRTabView: View {
                     .buttonStyle(.borderless)
             }
 
-            // File picker
+            HStack(spacing: 6) {
+                Image(systemName: "clock")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+                Text("\(app.resultCount) file(s)  •  \(String(format: "%.1f", app.elapsed))s total")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let r = app.results {
+                    let totalSw = r.reduce(0) { $0 + $1.duration }
+                    Text("  •  \(String(format: "%.1f", totalSw))s processing")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.bottom, 4)
+
             if let r = app.results, r.count > 1 {
                 Picker("File:", selection: $app.selectedResultIndex) {
                     ForEach(Array(r.enumerated()), id: \.offset) { i, item in
@@ -176,7 +121,6 @@ struct OCRTabView: View {
                 .pickerStyle(.menu)
             }
 
-            // Result text
             if let item = app.selectedResult {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
@@ -223,11 +167,11 @@ struct OCRTabView: View {
             Image(systemName: "text.viewfinder")
                 .font(.system(size: 48))
                 .foregroundStyle(.tertiary)
-            Text("Select images or folders\nto extract text")
+            Text("Drag images or folders here\nto extract text")
                 .font(.title3)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Text("or drag & drop them anywhere")
+            Text("drop anywhere on this window")
                 .font(.subheadline)
                 .foregroundStyle(.tertiary)
         }
@@ -261,10 +205,9 @@ struct OCRTabView: View {
         guard pending > 0 else { return }
         var urls: [URL] = []
         let lock = NSLock()
-        var progressList: [Progress] = []
 
         for provider in providers {
-            let p = provider.loadObject(ofClass: NSURL.self) { item, _ in
+            provider.loadObject(ofClass: NSURL.self) { item, _ in
                 let url = (item as? NSURL) as? URL
                 lock.lock()
                 if let url { urls.append(url) }
@@ -273,7 +216,6 @@ struct OCRTabView: View {
                 lock.unlock()
 
                 if done {
-                    // Check if any URL is a directory — expand it
                     var all: [URL] = []
                     for u in urls {
                         var isDir: ObjCBool = false
@@ -285,13 +227,10 @@ struct OCRTabView: View {
                         }
                     }
                     DispatchQueue.main.async {
-                        self.dropProgress = []
                         self.app.addURLs(all)
                     }
                 }
             }
-            progressList.append(p)
         }
-        dropProgress = progressList
     }
 }

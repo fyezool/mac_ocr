@@ -9,6 +9,7 @@ final class ServerViewModel: ObservableObject {
     @Published var address: String = ""
     @Published var logs: [ServerLogEntry] = []
     @Published var errorMessage: String?
+    @Published var clients: [ConnectedClient] = []
 
     private let server = ServerManager()
 
@@ -27,7 +28,12 @@ final class ServerViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.isRunning = on
-                self.address = info
+                // info is the URL string — extract just the IP
+                if let url = URL(string: info), let host = url.host {
+                    self.address = host
+                } else {
+                    self.address = info
+                }
                 if !on, info.hasPrefix("Error:") {
                     self.errorMessage = info
                 }
@@ -37,6 +43,11 @@ final class ServerViewModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.logs = Array(self.server.recentLog)
+            }
+        }
+        server.onClientsChanged = { [weak self] clients in
+            Task { @MainActor in
+                self?.clients = clients
             }
         }
         server.start(port: 8080)

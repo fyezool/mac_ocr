@@ -33,6 +33,8 @@ struct OCRBenchmark {
             exit(1)
         }
 
+        let useAutoLang = args.contains("--auto-lang")
+
         let modeLabel = useFast ? "fast + parallel" : (useSequential ? "accurate + sequential" : "accurate + parallel")
 
         // Find first non-flag argument as folder path
@@ -69,7 +71,11 @@ struct OCRBenchmark {
         if useSequential {
             results = await OCRService.recognizeTextSequential(paths: paths, fast: useFast)
         } else {
-            results = await OCRService.recognizeText(paths: paths, fast: useFast)
+            var config = OCRConfiguration.default
+            if useFast { config.recognitionLevel = .fast }
+            config.automaticallyDetectsLanguage = useAutoLang
+            config.customWords = ["OCR", "Apple", "Vision", "Neural Engine"]
+            results = await OCRService.recognizeText(paths: paths, config: config)
         }
         let totalElapsed = CFAbsoluteTimeGetCurrent() - startTotal
 
@@ -120,6 +126,7 @@ struct OCRBenchmark {
           --json [path]    Output in JSON format (optionally save to file)
           --fast           Use .fast recognition level (parallel, 2-3x faster, may miss text)
           --sequential     Process images one at a time (no parallelism, useful for baseline comparison)
+          --auto-lang      Enable automatic language detection per image (slower, useful for mixed languages)
           --help, -h       Show this help
 
         Modes (default: accurate + parallel):
@@ -127,11 +134,12 @@ struct OCRBenchmark {
           --fast           Fast + parallel (~6× faster than accurate, may miss text)
           --sequential     Accurate + sequential (baseline, matches original behavior)
 
-        Example:
+        Examples:
           swift run OCRBenchmark ~/Screenshots
           swift run OCRBenchmark ~/Screenshots --fast
           swift run OCRBenchmark ~/Screenshots --sequential
           swift run OCRBenchmark ~/Screenshots --json results.json
+          swift run OCRBenchmark ~/Screenshots --auto-lang --json results.json
         """)
     }
 

@@ -8,21 +8,36 @@ struct ServerTabView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                // MARK: - Header
-                headerSection
+                    headerSection
+                    statusCard
 
-                // MARK: - Status card
-                statusCard
+                    if let err = server.errorMessage {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.red)
+                            Text(err)
+                                .font(.subheadline)
+                                .foregroundStyle(.red)
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.red.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
 
-                // MARK: - Logs
-                if !server.logs.isEmpty {
-                    logSection
-                } else {
-                    emptyLogState
-                }
+                    if server.isRunning {
+                        clientsSection
+                    }
+
+                    if !server.logs.isEmpty {
+                        logSection
+                    } else {
+                        emptyLogState
+                    }
+
             }
             .padding(20)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .frame(maxWidth: .infinity, alignment: .top)
         }
     }
 
@@ -87,6 +102,49 @@ struct ServerTabView: View {
         )
     }
 
+    // MARK: - Connected Clients
+
+    private var clientsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Connected Clients", systemImage: "person.2")
+                    .font(.headline)
+
+                Spacer()
+
+                Text("\(server.clients.filter(\.isActive).count) active")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(.fill.quaternary)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            }
+
+            if server.clients.isEmpty {
+                HStack {
+                    Image(systemName: "person.fill.questionmark")
+                        .foregroundStyle(.tertiary)
+                    Text("Waiting for connections…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 8)
+            } else {
+                ForEach(server.clients) { client in
+                    ClientRow(client: client)
+                }
+            }
+        }
+        .padding(16)
+        .background(.fill.quinary)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(.separator, lineWidth: 1)
+        )
+    }
+
     // MARK: - Log Section
 
     private var logSection: some View {
@@ -131,6 +189,43 @@ struct ServerTabView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 60)
+    }
+}
+
+// MARK: - Client Row
+
+private struct ClientRow: View {
+    let client: ConnectedClient
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(client.isActive ? Color.green : Color.gray.opacity(0.4))
+                .frame(width: 8, height: 8)
+
+            Image(systemName: client.isActive ? "desktopcomputer" : "desktopcomputer")
+                .font(.caption)
+                .foregroundStyle(client.isActive ? .secondary : .tertiary)
+
+            Text(client.ip)
+                .font(.caption.monospaced())
+                .foregroundStyle(client.isActive ? .primary : .secondary)
+
+            Text(client.path)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            Spacer()
+
+            Text(client.isActive ? "connected \(Text(client.connectedAt, style: .relative))" : "\(Text(String(format: "%.1fs", client.duration)))")
+                .font(.caption.monospaced())
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 8)
+        .background(.fill.quaternary.opacity(client.isActive ? 0.3 : 0.1))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 }
 

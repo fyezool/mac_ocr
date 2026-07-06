@@ -1,6 +1,18 @@
 {
   "version": 1,
   "skills": {
+    "apple-on-device-ai": {
+      "source": "dpearson2699/swift-ios-skills",
+      "sourceType": "github",
+      "skillPath": "skills/apple-on-device-ai/SKILL.md",
+      "computedHash": "4395246b8f716ada6612e2f7c779b8e8a57236be56ce3d0cb555415039ff2790"
+    },
+    "coreml": {
+      "source": "dpearson2699/swift-ios-skills",
+      "sourceType": "github",
+      "skillPath": "skills/coreml/SKILL.md",
+      "computedHash": "ab69097c42fbdf07cb003f0ba2a70cad38c453bf8b9478ddccc2bb9da6cf1771"
+    },
     "expo-ui": {
       "source": "expo/skills",
       "sourceType": "github",
@@ -42,6 +54,18 @@
       "sourceType": "github",
       "skillPath": "swiftui-pro/SKILL.md",
       "computedHash": "07033426e384295a4b49cf0b2ffdefd4098cae4af53fef16bc1f2d9281118c41"
+    },
+    "swiftui-webkit": {
+      "source": "dpearson2699/swift-ios-skills",
+      "sourceType": "github",
+      "skillPath": "skills/swiftui-webkit/SKILL.md",
+      "computedHash": "08a604819b46a5cbf2d86c8bf1f7db464d6f60e440df79f7dca33c7271d19cda"
+    },
+    "vision-framework": {
+      "source": "dpearson2699/swift-ios-skills",
+      "sourceType": "github",
+      "skillPath": "skills/vision-framework/SKILL.md",
+      "computedHash": "2633ba482dca4336b571ed2e6f17ab429ea6c79feb0a043c89654eea51c08452"
     }
   }
 }
