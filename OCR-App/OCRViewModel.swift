@@ -90,6 +90,7 @@ final class OCRViewModel: ObservableObject {
                 guard gen == self.generation else { return }
                 elapsed = startTime.map { Date().timeIntervalSince($0) } ?? 0
                 results = r
+                saveToHistory()
                 isBusy = false
                 selectedResultIndex = 0
             }
@@ -133,7 +134,7 @@ final class OCRViewModel: ObservableObject {
 
     // MARK: - History persistence
 
-    private(set) var history: [HistoryEntry] = []
+    @Published private(set) var history: [HistoryEntry] = []
 
     func saveToHistory() {
         guard let r = results, !r.isEmpty else { return }

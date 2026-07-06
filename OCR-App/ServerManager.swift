@@ -174,7 +174,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         }
 
         let jsonData = ((try? JSONEncoder().encode(results)).flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
-        let html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>OCR</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,sans-serif;background:#f5f5f7;color:#1d1d1f;padding:40px 20px;display:flex;justify-content:center}.card{background:#fff;border-radius:18px;padding:32px;max-width:640px;width:100%}h1{font-size:22px;font-weight:600;margin-bottom:4px}.s{color:#6e6e73;font-size:14px;margin-bottom:20px}.top{display:flex;gap:8px;margin-bottom:16px}.top a,.top button{padding:10px 20px;border-radius:8px;font-size:13px;font-weight:500;text-decoration:none;text-align:center;flex:1;border:none;cursor:pointer}.top .sv{background:#007aff;color:#fff}.top .cl{background:#fff;color:#1d1d1f;border:1px solid #e5e5ea}select{width:100%;padding:10px 12px;border:1px solid #c7c7cc;border-radius:10px;font-size:14px;background:#fff;margin-bottom:12px;appearance:auto}.out{background:#f5f5f7;border:1px solid #e5e5ea;border-radius:10px;padding:16px;min-height:150px;font-family:Menlo,monospace;font-size:13px;white-space:pre-wrap;word-break:break-word;margin-bottom:12px}.e{color:#ff3b30;font-size:12px;margin-bottom:8px}#sv{background:none;border:none;font-size:13px;color:#007aff;cursor:pointer;float:right;margin-top:4px}</style></head><body><div class=\"card\"><h1>📄 OCR</h1><p class=\"s\">" + String(results.count) + " file(s)  •  ⏱ " + String(format: "%.1fs", el) + "</p><div class=\"top\"><button class=\"sv\" id=\"sv\">💾 Save All</button><button class=\"cl\" id=\"cp\">📋 Copy</button><a class=\"cl\" href=\"/\">✕ Clear</a></div><div id=\"err\"></div><select id=\"sel\" onchange=\"show()\">" + optRows + "</select><div class=\"out\" id=\"out\">" + firstText + "</div></div><script>var d=" + jsonData + ";function show(){var s=document.getElementById('sel');var i=s.selectedIndex;if(d&&i>=0&&i<d.length){document.getElementById('out').textContent=d[i].text||'(no text)';document.getElementById('err').textContent=d[i].error?'⚠️ '+d[i].error:''}}document.getElementById('sv').onclick=function(){var t='';for(var i=0;i<d.length;i++){t+='--- '+d[i].filename+' ---\\n'+(d[i].text||'(no text)')+'\\n\\n'}var a=document.createElement('a');a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(t);a.download='ocr_results.txt';a.click()};document.getElementById('cp').onclick=function(){var s=document.getElementById('sel');var i=s.selectedIndex;if(d&&i>=0&&i<d.length){navigator.clipboard.writeText(d[i].text||'')}}</script></body></html>"
+        let html = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>OCR Results</title><style>:root{--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--secondary:#6e6e73;--tertiary:#aeaeb2;--border:#c7c7cc;--accent:#007aff;--accent-hover:#0066d6;--shadow:rgba(0,0,0,0.08);--out-bg:#f5f5f7;--out-border:#e5e5ea}@media(prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--text:#f5f5f7;--secondary:#98989d;--tertiary:#636366;--border:#38383a;--accent:#0a84ff;--accent-hover:#409cff;--shadow:rgba(0,0,0,0.3);--out-bg:#3a3a3c;--out-border:#48484a}}*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Display\",\"SF Pro Text\",\"Helvetica Neue\",sans-serif;background:var(--bg);color:var(--text);padding:40px 20px;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;transition:background 0.3s ease}.card{background:var(--card);border-radius:20px;padding:32px;max-width:620px;width:100%;box-shadow:0 4px 24px var(--shadow);transition:background 0.3s ease}h1{font-size:24px;font-weight:700;letter-spacing:-0.02em;margin-bottom:2px}.meta{color:var(--secondary);font-size:13px;margin-bottom:20px;display:flex;align-items:center;gap:6px}.actions{display:flex;gap:8px;margin-bottom:16px}.actions button,.actions a{padding:10px 20px;border-radius:10px;font-size:13px;font-weight:500;text-decoration:none;text-align:center;flex:1;border:none;cursor:pointer;transition:all 0.2s ease;font-family:inherit}.actions .primary{background:var(--accent);color:#fff}.actions .primary:hover{background:var(--accent-hover)}.actions .secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.actions .secondary:hover{background:var(--out-bg)}select{width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:10px;font-size:14px;background:var(--card);color:var(--text);margin-bottom:14px;appearance:auto;transition:border-color 0.2s ease}.out{background:var(--out-bg);border:1px solid var(--out-border);border-radius:12px;padding:18px;min-height:160px;font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word;transition:background 0.3s ease,border-color 0.3s ease}.err{color:var(--warning,#ff9500);font-size:12px;margin-top:6px;min-height:18px}.footer{margin-top:20px;padding-top:16px;border-top:1px solid var(--border);font-size:12px;color:var(--tertiary);text-align:center}</style></head><body><div class=\"card\"><h1>📄 Results</h1><p class=\"meta\"><span>" + String(results.count) + " file(s)</span><span>•</span><span>⏱ " + String(format: "%.1f", el) + "s</span></p><div class=\"actions\"><button class=\"primary\" id=\"sv\">💾 Save All</button><button class=\"secondary\" id=\"cp\">📋 Copy</button><a class=\"secondary\" href=\"/\">✕ Clear</a></div><div class=\"err\" id=\"err\"></div><select id=\"sel\" onchange=\"show()\">" + optRows + "</select><div class=\"out\" id=\"out\">" + firstText + "</div></div><script>var d=" + jsonData + ";function show(){var s=document.getElementById('sel');var i=s.selectedIndex;if(d&&i>=0&&i<d.length){document.getElementById('out').textContent=d[i].text||'(no text)';document.getElementById('err').textContent=d[i].error?'⚠️ '+d[i].error:''}}document.getElementById('sv').onclick=function(){var t='';for(var i=0;i<d.length;i++){t+='--- '+d[i].filename+' ---\\n'+(d[i].text||'(no text)')+'\\n\\n'}var a=document.createElement('a');a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(t);a.download='ocr_results.txt';a.click()};document.getElementById('cp').onclick=function(){var s=document.getElementById('sel');var i=s.selectedIndex;if(d&&i>=0&&i<d.length){navigator.clipboard.writeText(d[i].text||'')}}</script></body></html>"
 
         sendAndClose(fd, 200, html, "text/html; charset=utf-8")
         log("POST", "/ocr", ip, "\(results.count) files", el, 200)
@@ -294,53 +294,193 @@ private func localAddress() -> String? {
 
 private let webHTML = """
 <!DOCTYPE html>
-<html>
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>OCR</title>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>OCR</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,sans-serif;background:#f5f5f7;color:#1d1d1f;padding:40px 20px;display:flex;justify-content:center}
-.card{background:#fff;border-radius:18px;padding:32px;max-width:640px;width:100%}
-h1{font-size:22px;font-weight:600;margin-bottom:4px}
-.sub{color:#6e6e73;font-size:14px;margin-bottom:20px}
-.zone{border:2px dashed #c7c7cc;border-radius:12px;padding:30px;text-align:center;margin-bottom:16px;cursor:pointer;background:#fff}
-.zone:hover,.zone.dragover{border-color:#007aff;background:#f0f7ff}
-.zone p{color:#6e6e73;font-size:14px}
-.go{display:block;width:100%;padding:12px;border:none;border-radius:10px;font-size:15px;font-weight:500;cursor:pointer;text-align:center;background:#007aff;color:#fff;margin-bottom:8px}
-.fast{display:flex;align-items:center;justify-content:center;gap:6px;margin-bottom:12px;font-size:12px;color:#6e6e73}
-.fast input{cursor:pointer}
-.st{font-size:13px;text-align:center;margin-bottom:10px;color:#6e6e73;min-height:20px}
-.st.e{color:#e68a00}
+  :root {
+    --bg: #f5f5f7;
+    --card: #ffffff;
+    --text: #1d1d1f;
+    --secondary: #6e6e73;
+    --tertiary: #aeaeb2;
+    --border: #c7c7cc;
+    --accent: #007aff;
+    --accent-hover: #0066d6;
+    --shadow: rgba(0,0,0,0.08);
+    --drop-border: #c7c7cc;
+    --drop-bg: #ffffff;
+    --drop-hover-bg: #f0f7ff;
+    --drop-hover-border: #007aff;
+    --success: #34c759;
+    --warning: #ff9500;
+    --error: #ff3b30;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1c1e;
+      --card: #2c2c2e;
+      --text: #f5f5f7;
+      --secondary: #98989d;
+      --tertiary: #636366;
+      --border: #38383a;
+      --accent: #0a84ff;
+      --accent-hover: #409cff;
+      --shadow: rgba(0,0,0,0.3);
+      --drop-border: #48484a;
+      --drop-bg: #2c2c2e;
+      --drop-hover-bg: #1a2f44;
+      --drop-hover-border: #0a84ff;
+    }
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",sans-serif;
+    background:var(--bg);color:var(--text);padding:40px 20px;
+    display:flex;justify-content:center;align-items:flex-start;min-height:100vh;
+    -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+    transition:background 0.3s ease,color 0.3s ease;
+  }
+  .card{
+    background:var(--card);border-radius:20px;padding:32px;
+    max-width:560px;width:100%;
+    box-shadow:0 4px 24px var(--shadow);
+    transition:background 0.3s ease,box-shadow 0.3s ease;
+  }
+  h1{font-size:24px;font-weight:700;letter-spacing:-0.02em;margin-bottom:4px}
+  .sub{color:var(--secondary);font-size:14px;margin-bottom:24px;line-height:1.4}
 
+  /* Drop Zone */
+  .zone{
+    border:2px dashed var(--drop-border);border-radius:16px;
+    padding:36px 24px;text-align:center;margin-bottom:20px;
+    cursor:pointer;background:var(--drop-bg);
+    transition:all 0.25s ease;position:relative;
+  }
+  .zone:hover,.zone.dragover{
+    border-color:var(--drop-hover-border);
+    background:var(--drop-hover-bg);
+    transform:scale(1.01);
+  }
+  .zone-icon{font-size:40px;display:block;margin-bottom:12px;opacity:0.7}
+  .zone p{color:var(--secondary);font-size:14px;line-height:1.5}
+  .zone .hint{font-size:12px;color:var(--tertiary);margin-top:6px}
 
+  /* Button */
+  .btn{
+    display:block;width:100%;padding:14px;border:none;
+    border-radius:12px;font-size:15px;font-weight:600;
+    cursor:pointer;text-align:center;
+    background:var(--accent);color:#fff;
+    transition:all 0.2s ease;
+    -webkit-font-smoothing:antialiased;
+  }
+  .btn:hover{background:var(--accent-hover);transform:translateY(-1px)}
+  .btn:active{transform:translateY(0);opacity:0.9}
+  .btn:disabled{opacity:0.5;cursor:not-allowed;transform:none}
 
+  /* Fast toggle */
+  .fast-row{
+    display:flex;align-items:center;justify-content:center;gap:8px;
+    margin-top:12px;font-size:13px;color:var(--secondary);
+  }
+  .fast-row input[type="checkbox"]{
+    width:16px;height:16px;accent-color:var(--accent);cursor:pointer;
+  }
+  .fast-row label{cursor:pointer;user-select:none}
+
+  /* Status */
+  .st{
+    font-size:13px;text-align:center;margin-top:14px;
+    color:var(--secondary);min-height:22px;
+    transition:color 0.2s ease;
+  }
+  .st.e{color:var(--warning);font-weight:500}
+
+  /* Loading spinner */
+  .spinner{display:none;width:20px;height:20px;margin:0 auto 8px;
+    border:2.5px solid var(--border);border-top-color:var(--accent);
+    border-radius:50%;animation:spin 0.8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .loading .spinner{display:block}
 </style></head>
 <body>
 <div class="card">
-<h1>📄 OCR</h1>
-<p class="sub">Upload images to extract text</p>
-<div class="zone" id="dz">
-<p>📁 Tap to choose or drag & drop files</p>
-<p style="font-size:11px;color:#999;margin-top:4px">Supports: PNG, JPG, GIF, BMP, TIFF, HEIC, WebP</p>
-<div id="cnt" style="font-size:13px;font-weight:500;margin-top:6px"></div></div>
-<input type="file" id="fi" name="image" accept="image/*" multiple style="display:none">
+  <h1>📄 OCR</h1>
+  <p class="sub">Upload images to extract text</p>
 
-<button class="go" id="go">Run OCR</button>
-<label class="fast"><input type="checkbox" id="fast"> Fast mode (~3× faster, may miss text)</label>
-<div class="st" id="st"></div>
+  <div class="zone" id="dz">
+    <span class="zone-icon">📁</span>
+    <p>Choose images or drag &amp; drop here</p>
+    <p class="hint">PNG, JPG, GIF, BMP, TIFF, HEIC, WebP</p>
+    <div id="cnt" style="font-size:13px;font-weight:600;margin-top:10px;color:var(--accent)"></div>
+  </div>
+  <input type="file" id="fi" name="image" accept="image/png,image/jpeg,image/gif,image/bmp,image/tiff,image/heic,image/webp" multiple style="display:none">
+
+  <button class="btn" id="go">Run OCR</button>
+  <div class="fast-row">
+    <input type="checkbox" id="fast">
+    <label for="fast">Fast mode (~3× faster, may miss text)</label>
+  </div>
+  <div class="st" id="st"></div>
+  <div class="spinner" id="spinner"></div>
 </div>
 <script>
-var dz=document.getElementById('dz'),fi=document.getElementById('fi'),cnt=document.getElementById('cnt'),go=document.getElementById('go'),st=document.getElementById('st'),fast=document.getElementById('fast');
-var sel=[];var xhr;
-var exts=['png','jpg','jpeg','gif','bmp','tiff','tif','heic','webp'];
-dz.onclick=function(){fi.click()};
-fi.onchange=function(){sel=[];for(var i=0;i<fi.files.length;i++)sel.push(fi.files[i]);listar()};
-dz.ondragover=function(e){e.preventDefault();dz.classList.add('dragover')};
-dz.ondragleave=function(){dz.classList.remove('dragover')};
-dz.ondrop=function(e){e.preventDefault();dz.classList.remove('dragover');sel=[];for(var i=0;i<e.dataTransfer.files.length;i++)sel.push(e.dataTransfer.files[i]);listar()};
-function listar(){cnt.textContent=sel.length+' file(s)';var bad=0;for(var i=0;i<sel.length;i++){var n=sel[i].name;var e=n.split('.').pop().toLowerCase();if(exts.indexOf(e)<0)bad++}if(bad)st.textContent='⚠️ '+bad+' of '+sel.length+' file(s) have unsupported formats';else st.textContent='';st.className=bad?'st e':'st'}
-go.onclick=function(){if(!sel.length){st.className='st e';st.textContent='Select files first';return}st.className='st';st.textContent='Processing '+sel.length+' file(s)...';var t0=Date.now();var timer=setInterval(function(){var e=((Date.now()-t0)/1000).toFixed(1);st.textContent='⏱ '+e+'s  •  '+sel.length+' file(s)'},100);var fd=new FormData();for(var i=0;i<sel.length;i++)fd.append('image',sel[i]);var url='/ocr'+(fast.checked?'?fast=1':'');xhr=new XMLHttpRequest();xhr.open('POST',url,true);xhr.onload=function(){clearInterval(timer);if(xhr.status==200){document.write(xhr.responseText)}else{st.className='st e';st.textContent='Error'}};xhr.onerror=function(){clearInterval(timer);st.className='st e';st.textContent='Connection error'};xhr.send(fd)};
+(function(){
+  var dz=document.getElementById('dz'),fi=document.getElementById('fi'),
+      cnt=document.getElementById('cnt'),go=document.getElementById('go'),
+      st=document.getElementById('st'),fast=document.getElementById('fast'),
+      sp=document.getElementById('spinner');
+  var sel=[];
+  var exts=['png','jpg','jpeg','gif','bmp','tiff','tif','heic','webp'];
+
+  dz.onclick=function(){fi.click()};
+  fi.onchange=function(){sel=[];for(var i=0;i<fi.files.length;i++)sel.push(fi.files[i]);listar()};
+
+  dz.ondragover=function(e){e.preventDefault();dz.classList.add('dragover')};
+  dz.ondragleave=function(){dz.classList.remove('dragover')};
+  dz.ondrop=function(e){e.preventDefault();dz.classList.remove('dragover');
+    sel=[];for(var i=0;i<e.dataTransfer.files.length;i++)sel.push(e.dataTransfer.files[i]);listar()};
+
+  function listar(){
+    if(!sel.length){cnt.textContent='';return}
+    cnt.textContent=sel.length+' file(s) selected';
+    var bad=0;
+    for(var i=0;i<sel.length;i++){
+      var n=sel[i].name,e=n.split('.').pop().toLowerCase();
+      if(exts.indexOf(e)<0)bad++
+    }
+    if(bad){st.textContent='⚠️ '+bad+' of '+sel.length+' file(s) have unsupported formats';st.className='st e'}
+    else{st.textContent='';st.className='st'}
+  }
+
+  go.onclick=function(){
+    if(!sel.length){st.className='st e';st.textContent='Select files first';return}
+    st.className='st';var t0=Date.now();
+    sp.style.display='block';
+    var timer=setInterval(function(){
+      st.textContent='⏱ '+((Date.now()-t0)/1000).toFixed(1)+'s  •  '+sel.length+' file(s)'
+    },100);
+    var fd=new FormData();
+    for(var i=0;i<sel.length;i++)fd.append('image',sel[i]);
+    var url='/ocr'+(fast.checked?'?fast=1':'');
+    var xhr=new XMLHttpRequest();
+    xhr.open('POST',url,true);
+    xhr.onload=function(){
+      clearInterval(timer);sp.style.display='none';
+      if(xhr.status==200){document.write(xhr.responseText)}
+      else{st.className='st e';st.textContent='Error: server returned '+xhr.status}
+    };
+    xhr.onerror=function(){clearInterval(timer);sp.style.display='none';
+      st.className='st e';st.textContent='Connection error — is the server running?'};
+    xhr.send(fd)
+  };
+})();
 </script>
-</body></html>
+</body>
+</html>
 """
 
 
