@@ -210,7 +210,7 @@ struct OCRBenchmark {
                 [
                     "filename": r.filename,
                     "text": r.text,
-                    "error": r.error as Any,
+                    "error": r.error as Any? ?? NSNull(),
                     "duration_seconds": r.duration,
                 ]
             },

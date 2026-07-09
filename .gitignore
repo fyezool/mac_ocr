@@ -34,3 +34,4 @@ app.*.symbols
 
 # Reasonix
 .reasonix/
+reasonix.toml

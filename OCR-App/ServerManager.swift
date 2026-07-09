@@ -28,7 +28,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
     private var sockfd: Int32 = -1
     private var source: DispatchSourceRead?
     private var running = false
-    private let queue = DispatchQueue(label: "ocr-server", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "ocr-server", qos: .userInitiated, attributes: .concurrent)
     private var logEntries: [ServerLogEntry] = []
     private let logLock = NSLock()
     var onStatusChange: ((Bool, String) -> Void)?
@@ -128,12 +128,26 @@ final class ServerManager: NSObject, @unchecked Sendable {
     private func handle(_ fd: Int32, ip: String) {
         var buf = Data(); var tmp = [UInt8](repeating: 0, count: 65536)
         var attempts = 0
+        var hdrEndPos = -1
+        var contentLength = -1
         while attempts < 100 {
             let n = read(fd, &tmp, tmp.count)
             if n > 0 { buf.append(tmp, count: n); attempts = 0 }
             else if n == 0 { break }
             else if errno == EAGAIN || errno == EWOULDBLOCK { attempts += 1; usleep(10000); continue }
             else { break }
+            if hdrEndPos < 0, let r = buf.range(of: "\r\n\r\n".data(using: .utf8)!) {
+                hdrEndPos = r.upperBound
+                if let hdrStr = String(data: buf[buf.startIndex..<r.lowerBound], encoding: .utf8) {
+                    for line in hdrStr.components(separatedBy: "\r\n") {
+                        if let c = line.firstIndex(of: ":"), line.lowercased().hasPrefix("content-length") {
+                            contentLength = Int(line[line.index(after: c)...].trimmingCharacters(in: .whitespaces)) ?? -1
+                        }
+                    }
+                }
+            }
+            if hdrEndPos >= 0, contentLength >= 0, buf.count - hdrEndPos >= contentLength { break }
+            if hdrEndPos >= 0, contentLength < 0 { break }
         }
         guard buf.count > 0 else { Darwin.close(fd); return }
         let start = CFAbsoluteTimeGetCurrent()
@@ -247,6 +261,9 @@ final class ServerManager: NSObject, @unchecked Sendable {
         let bd = body.data(using: .utf8) ?? Data()
         let resp = "HTTP/1.1 \(status) \(st)\r\nContent-Type: \(ct)\r\nContent-Length: \(bd.count)\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
         guard var data = resp.data(using: .utf8) else { return }; data.append(bd)
+        // Make fd blocking so write() completes — the response is small and the socket closes after
+        var fl = fcntl(fd, F_GETFL, 0)
+        if fl >= 0 { fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) }
         data.withUnsafeBytes { buf in
             guard let base = buf.baseAddress else { return }
             var written = 0
@@ -285,7 +302,14 @@ final class ServerManager: NSObject, @unchecked Sendable {
             if let cr = part.range(of: "\r\n\r\n".data(using: .utf8)!),
                let h = String(data: part[part.startIndex..<cr.lowerBound], encoding: .utf8),
                h.contains("name=\"image\"") {
-                files.append(UFile(name: extractFN(h) ?? "upload", data: Data(part[cr.upperBound...])))
+                let raw = Data(part[cr.upperBound...])
+                let content: Data
+                if raw.count >= 2, raw[raw.count-2] == 13, raw[raw.count-1] == 10 {
+                    content = raw.subdata(in: 0..<(raw.count-2))
+                } else {
+                    content = raw
+                }
+                files.append(UFile(name: extractFN(h) ?? "upload", data: content))
             }
             pos = pe
         }
