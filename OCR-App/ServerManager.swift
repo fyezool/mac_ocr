@@ -130,9 +130,16 @@ final class ServerManager: NSObject, @unchecked Sendable {
         var attempts = 0
         var hdrEndPos = -1
         var contentLength = -1
+        // Hard ceiling on total request size (headers + multipart body). Prevents
+        // unbounded memory growth from a client that streams data forever.
+        let maxRequestBytes = 1_000_000_000  // 1GB safety cap
+        var tooLarge = false
         while attempts < 100 {
             let n = read(fd, &tmp, tmp.count)
-            if n > 0 { buf.append(tmp, count: n); attempts = 0 }
+            if n > 0 {
+                buf.append(tmp, count: n); attempts = 0
+                if buf.count > maxRequestBytes { tooLarge = true; break }
+            }
             else if n == 0 { break }
             else if errno == EAGAIN || errno == EWOULDBLOCK { attempts += 1; usleep(10000); continue }
             else { break }
@@ -142,6 +149,9 @@ final class ServerManager: NSObject, @unchecked Sendable {
                     for line in hdrStr.components(separatedBy: "\r\n") {
                         if let c = line.firstIndex(of: ":"), line.lowercased().hasPrefix("content-length") {
                             contentLength = Int(line[line.index(after: c)...].trimmingCharacters(in: .whitespaces)) ?? -1
+                            // Reject immediately if the declared length exceeds the cap —
+                            // don't buffer up to 1GB from a slow stream.
+                            if contentLength > maxRequestBytes { tooLarge = true }
                         }
                     }
                 }
@@ -150,8 +160,15 @@ final class ServerManager: NSObject, @unchecked Sendable {
             if hdrEndPos >= 0, contentLength < 0 { break }
         }
         guard buf.count > 0 else { Darwin.close(fd); return }
+        if tooLarge { sendAndClose(fd, 413, "Request too large", "text/plain"); return }
         let start = CFAbsoluteTimeGetCurrent()
         guard let req = Req(buf) else { sendAndClose(fd, 400, "Bad Request", "text/plain"); return }
+        // Host-header check: mitigate DNS rebinding. Require a Host header that
+        // is localhost, 127.0.0.1, or the machine's own detected LAN address.
+        guard let host = req.host, hostIsAllowed(host) else {
+            sendAndClose(fd, 403, "Forbidden", "text/plain")
+            return
+        }
         updateClientPath(fd, path: req.path)
         let fmt = parseFormat(from: req.path)
         let isFast = req.path.contains("?fast=1") || req.path.contains("&fast=1")
@@ -172,8 +189,16 @@ final class ServerManager: NSObject, @unchecked Sendable {
         }
     }
 
-    private func parseFormat(from path: String) -> String {
-        guard let q = path.firstIndex(of: "?") else { return "html" }
+    /// Validate the Host header against DNS rebinding: only allow the machine's
+    /// own address, loopback, or localhost. Accepts optional `:port` suffix.
+    private func hostIsAllowed(_ host: String) -> Bool {
+        let bare = host.components(separatedBy: ":").first?.trimmingCharacters(in: .whitespaces) ?? ""
+        if bare.isEmpty { return false }
+        if bare == "localhost" || bare == "127.0.0.1" || bare == "::1" { return true }
+        return bare == address
+    }
+
+    private func parseFormat(from path: String) -> String {        guard let q = path.firstIndex(of: "?") else { return "html" }
         let query = String(path[q...].dropFirst())
         for pair in query.components(separatedBy: "&") {
             let kv = pair.components(separatedBy: "=")
@@ -250,7 +275,10 @@ final class ServerManager: NSObject, @unchecked Sendable {
             optRows += "<option value=\"" + safeTxt.replacingOccurrences(of: "\"", with: "&quot;") + "\" data-err=\"" + esc(err) + "\">\(i+1). \(fn)\(status)</option>\n"
         }
 
-        let jsonData = ((try? JSONEncoder().encode(results)).flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
+        // Escape `<` as \u003C so OCR text containing "</script>" cannot break
+        // out of the inlined <script> block (JSON does not escape < by default).
+        let jsonData = ((((try? JSONEncoder().encode(results)).flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"))
+            .replacingOccurrences(of: "<", with: "\\u003C")
         let html = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>OCR Results</title><style>:root{--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--secondary:#6e6e73;--tertiary:#aeaeb2;--border:#c7c7cc;--accent:#007aff;--accent-hover:#0066d6;--shadow:rgba(0,0,0,0.08);--out-bg:#f5f5f7;--out-border:#e5e5ea}@media(prefers-color-scheme:dark){:root{--bg:#1c1c1e;--card:#2c2c2e;--text:#f5f5f7;--secondary:#98989d;--tertiary:#636366;--border:#38383a;--accent:#0a84ff;--accent-hover:#409cff;--shadow:rgba(0,0,0,0.3);--out-bg:#3a3a3c;--out-border:#48484a}}@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:0.01ms!important;transition-duration:0.01ms!important}}*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Display\",\"SF Pro Text\",\"Helvetica Neue\",sans-serif;background:var(--bg);color:var(--text);padding:40px 20px;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;-webkit-tap-highlight-color:transparent}.card{background:var(--card);border-radius:20px;padding:32px;max-width:620px;width:100%;box-shadow:0 4px 24px var(--shadow)}h1{font-size:24px;font-weight:700;letter-spacing:-0.02em;margin-bottom:2px}.meta{color:var(--secondary);font-size:13px;margin-bottom:20px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}.actions{display:flex;gap:8px;margin-bottom:16px}.actions button,.actions a{padding:10px 20px;border-radius:10px;font-size:13px;font-weight:500;text-decoration:none;text-align:center;flex:1;border:none;cursor:pointer;transition:all 0.2s ease;font-family:inherit}.actions button:focus-visible,.actions a:focus-visible{box-shadow:0 0 0 3px rgba(0,122,255,0.4)}.actions .primary{background:var(--accent);color:#fff}.actions .primary:hover{background:var(--accent-hover)}.actions .secondary{background:transparent;color:var(--text);border:1px solid var(--border)}.actions .secondary:hover{background:var(--out-bg)}select{width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:10px;font-size:14px;background:var(--card);color:var(--text);margin-bottom:14px;appearance:auto}select:focus-visible{box-shadow:0 0 0 3px rgba(0,122,255,0.4)}.out{background:var(--out-bg);border:1px solid var(--out-border);border-radius:12px;padding:18px;min-height:160px;font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-word}.err{color:#ff9500;font-size:12px;margin-top:6px;min-height:18px}.t{color:var(--tertiary);font-size:12px}.footer{margin-top:20px;padding-top:16px;border-top:1px solid var(--border);font-size:12px;color:var(--tertiary);text-align:center}</style></head><body><main><div class=\"card\"><h1>📄 Results</h1><p class=\"meta\"><span>" + String(results.count) + " file(s)</span><span>•</span><span>⏱ " + String(format: "%.1f", el) + "s wall</span><span class=\"t\">• " + String(format: "%.1f", totalDuration) + "s processing</span></p><div class=\"actions\"><button class=\"primary\" id=\"sv\">💾 Save All</button><button class=\"secondary\" id=\"cp\">📋 Copy</button><a class=\"secondary\" href=\"/\">✕ Clear</a></div><div class=\"err\" id=\"err\" aria-live=\"polite\" role=\"status\"></div><label for=\"sel\" class=\"sr-only\" style=\"position:absolute;width:1px;height:1px;overflow:hidden\">Select a file</label><select id=\"sel\" onchange=\"show()\">" + optRows + "</select><div class=\"out\" id=\"out\">" + firstText + "</div><div class=\"footer\">OCR Batch Processor</div></div></main><script>(function(){const d=" + jsonData + ";const sel=document.getElementById('sel'),out=document.getElementById('out'),err=document.getElementById('err');function show(){const i=sel.selectedIndex;if(d&&i>=0&&i<d.length){out.textContent=d[i].text||'(no text)';err.textContent=d[i].error?'⚠️ '+d[i].error:''}}window.show=show;document.getElementById('sv').onclick=function(){let t='';for(const r of d){t+='--- '+r.filename+' ---\\n'+(r.text||'(no text)')+'\\n\\n'}const a=document.createElement('a');a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(t);a.download='ocr_results.txt';a.click()};document.getElementById('cp').onclick=function(){const i=sel.selectedIndex;if(d&&i>=0&&i<d.length){navigator.clipboard.writeText(d[i].text||'')}};if(d&&d.length)show()})();</script></body></html>"
 
         sendAndClose(fd, 200, html, "text/html; charset=utf-8")
@@ -258,7 +286,10 @@ final class ServerManager: NSObject, @unchecked Sendable {
     }
 
     private func esc(_ s: String) -> String {
-        s.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;").replacingOccurrences(of: ">", with: "&gt;")
+        s.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
     }
 
     // MARK: - Helpers
@@ -266,7 +297,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
     private func send(_ fd: Int32, _ status: Int, _ body: String, _ ct: String) {
         let st = ["200":"OK","204":"No Content","400":"Bad Request","404":"Not Found","413":"Payload Too Large","500":"Internal Server Error"][String(status)] ?? ""
         let bd = body.data(using: .utf8) ?? Data()
-        let resp = "HTTP/1.1 \(status) \(st)\r\nContent-Type: \(ct)\r\nContent-Length: \(bd.count)\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+        let resp = "HTTP/1.1 \(status) \(st)\r\nContent-Type: \(ct)\r\nContent-Length: \(bd.count)\r\nConnection: close\r\n\r\n"
         guard var data = resp.data(using: .utf8) else { return }; data.append(bd)
         // Make fd blocking so write() completes — the response is small and the socket closes after
         var fl = fcntl(fd, F_GETFL, 0)
@@ -342,6 +373,7 @@ private struct BatchOCRResponse: Codable {
 
 private struct Req {
     let method: String; let path: String; let body: Data; let boundary: String?
+    let host: String?
     init?(_ data: Data) {
         // Find the end of headers first (before any binary body data)
         guard let hdrEnd = data.range(of: "\r\n\r\n".data(using: .utf8)!) else { return nil }
@@ -353,6 +385,7 @@ private struct Req {
         var h: [String: String] = [:]
         for line in hL.dropFirst() { if let c = line.firstIndex(of: ":") { h[String(line[line.startIndex..<c]).trimmingCharacters(in: .whitespaces)] = String(line[line.index(after: c)...]).trimmingCharacters(in: .whitespaces) } }
         body = Data(data[hdrEnd.upperBound...])
+        host = h["Host"]
         if let ct = h["Content-Type"], ct.hasPrefix("multipart/form-data"), let br = ct.range(of: "boundary=") { boundary = String(ct[br.upperBound...]).trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "").removingPercentEncoding ?? "" } else { boundary = nil }
     }
 }
