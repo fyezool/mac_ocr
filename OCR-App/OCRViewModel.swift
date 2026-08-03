@@ -41,7 +41,7 @@ final class OCRViewModel: ObservableObject {
             FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
             if isDir.boolValue {
                 all.append(contentsOf: OCRService.collectImages(from: url))
-            } else {
+            } else if isUnderIngestLimit(url) {
                 all.append(url)
             }
         }
@@ -50,6 +50,11 @@ final class OCRViewModel: ObservableObject {
         files = all
         results = nil
         errorMessage = nil
+    }
+
+    private func isUnderIngestLimit(_ url: URL) -> Bool {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return true }
+        return Int64(size) <= OCRService.maxIngestBytes
     }
 
     func runOCR() {

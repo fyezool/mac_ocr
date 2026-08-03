@@ -33,7 +33,10 @@ struct OCRConfiguration {
     var minimumTextHeight: Float = 0.0
 
     /// Maximum concurrent images processed at once.
-    /// Apple Silicon ANE benefits from moderate parallelism (4–6).
+    /// The ANE has 16 physical cores but only a 32MB on-chip SRAM working set;
+    /// exceeding it spills to DRAM (~30% throughput drop) and risks Jetsam under
+    /// memory pressure. 2–4 concurrent Vision requests is the empirically safe
+    /// band — values above 4 are clamped to the ceiling (see `clampedConcurrency`).
     var maxConcurrency: Int = 4
 
     /// Whether to automatically detect the dominant language per image.
@@ -46,6 +49,23 @@ struct OCRConfiguration {
 // MARK: - OCR Service
 
 enum OCRService {
+
+    /// Defensive ceiling for concurrent Vision requests (ANE "SRAM performance
+    /// cliff" defense). The ANE evaluation queue accepts up to 127 requests but
+    /// has only 16 physical cores and a 32MB on-chip SRAM budget; more than ~4
+    /// concurrent high-resolution requests risks DRAM spill (~30% throughput
+    /// drop) and Jetsam termination under memory pressure.
+    private static let concurrencyCeiling = 4
+
+    /// Stability limit for single-file memory ingestion (MAX_FILE_SIZE_INGEST).
+    /// Files larger than this are skipped during collection to avoid OOM /
+    /// Jetsam on high-volume ingestion.
+    static let maxIngestBytes: Int64 = 250 * 1024 * 1024
+
+    /// Clamp a requested concurrency into the safe band [1, 4].
+    private static func clampedConcurrency(_ requested: Int) -> Int {
+        min(max(requested, 1), concurrencyCeiling)
+    }
 
     /// Run Vision text recognition on every image at `paths`.
     /// Processes images in parallel using the ANE (Apple Neural Engine) via
@@ -62,7 +82,7 @@ enum OCRService {
     ) async -> [OCRItem] {
         var cfg = config
         if fast { cfg.recognitionLevel = .fast }
-        let maxConcurrent = min(paths.count, cfg.maxConcurrency)
+        let maxConcurrent = min(paths.count, Self.clampedConcurrency(cfg.maxConcurrency))
 
         return await withTaskGroup(of: (Int, [OCRItem]).self) { group in
             var index = 0
@@ -336,9 +356,12 @@ enum OCRService {
         ) else { return images }
 
         for case let fileURL as URL in enumerator {
-            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]),
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
                   values.isRegularFile == true
             else { continue }
+
+            // Skip files over the 250MB ingest stability limit.
+            if let size = values.fileSize, Int64(size) > maxIngestBytes { continue }
 
             if imageExtensions.contains(fileURL.pathExtension.lowercased()) {
                 images.append(fileURL)

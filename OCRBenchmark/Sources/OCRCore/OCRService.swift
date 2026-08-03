@@ -66,6 +66,18 @@ public struct OCRConfiguration: Sendable {
 
 public enum OCRService {
 
+    /// Defensive ceiling for concurrent Vision requests (ANE "SRAM performance
+    /// cliff" defense): 16 ANE physical cores, 32MB on-chip SRAM budget.
+    private static let concurrencyCeiling = 4
+
+    /// Stability limit for single-file memory ingestion (MAX_FILE_SIZE_INGEST).
+    static let maxIngestBytes: Int64 = 250 * 1024 * 1024
+
+    /// Clamp a requested concurrency into the safe band [1, 4].
+    public static func clampedConcurrency(_ requested: Int) -> Int {
+        min(max(requested, 1), concurrencyCeiling)
+    }
+
     /// Run Vision text recognition on every image at `paths`.
     /// Processes images in parallel using the ANE (Apple Neural Engine) via
     /// Core ML, which is the backend Apple's Vision framework uses internally.
@@ -81,7 +93,7 @@ public enum OCRService {
     ) async -> [OCRItem] {
         var cfg = config
         if fast { cfg.recognitionLevel = .fast }
-        let maxConcurrent = min(paths.count, cfg.maxConcurrency)
+        let maxConcurrent = min(paths.count, Self.clampedConcurrency(cfg.maxConcurrency))
 
         return await withTaskGroup(of: (Int, [OCRItem]).self) { group in
             var index = 0
@@ -339,9 +351,12 @@ public enum OCRService {
         ) else { return images }
 
         for case let fileURL as URL in enumerator {
-            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]),
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
                   values.isRegularFile == true
             else { continue }
+
+            // Skip files over the 250MB ingest stability limit.
+            if let size = values.fileSize, Int64(size) > maxIngestBytes { continue }
 
             if imageExtensions.contains(fileURL.pathExtension.lowercased()) {
                 images.append(fileURL)

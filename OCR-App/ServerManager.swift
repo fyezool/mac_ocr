@@ -191,6 +191,13 @@ final class ServerManager: NSObject, @unchecked Sendable {
         let files = parseMultiAll(req.body, b)
         guard !files.isEmpty else { sendAndClose(fd, 400, "{\"success\":false,\"error\":\"No image\"}", "application/json"); return }
 
+        // Reject files over the 250MB ingest stability limit (MAX_FILE_SIZE_INGEST).
+        let oversized = files.filter { $0.data.count > Int(OCRService.maxIngestBytes) }
+        if !oversized.isEmpty {
+            sendAndClose(fd, 413, "{\"success\":false,\"error\":\"File too large (max 250MB)\"}", "application/json")
+            return
+        }
+
         var tmpFiles: [(String, URL)] = []
         for f in files {
             let ext = (f.name as NSString).pathExtension.lowercased()
@@ -257,7 +264,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
     // MARK: - Helpers
 
     private func send(_ fd: Int32, _ status: Int, _ body: String, _ ct: String) {
-        let st = ["200":"OK","204":"No Content","400":"Bad Request","404":"Not Found","500":"Internal Server Error"][String(status)] ?? ""
+        let st = ["200":"OK","204":"No Content","400":"Bad Request","404":"Not Found","413":"Payload Too Large","500":"Internal Server Error"][String(status)] ?? ""
         let bd = body.data(using: .utf8) ?? Data()
         let resp = "HTTP/1.1 \(status) \(st)\r\nContent-Type: \(ct)\r\nContent-Length: \(bd.count)\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
         guard var data = resp.data(using: .utf8) else { return }; data.append(bd)
