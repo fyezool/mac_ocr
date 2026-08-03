@@ -28,6 +28,7 @@ Pods/
 DerivedData/
 .build/
 build/
+dist/
 
 # Symbolication
 app.*.symbols
