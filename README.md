@@ -1,21 +1,26 @@
 # OCR Batch Processor
 
-macOS desktop app for batch OCR using Apple Vision. Built-in HTTP server for
-sharing OCR over the local network.
+macOS app for batch OCR using Apple Vision, accelerated by the Apple Neural
+Engine (ANE). Built-in HTTP server for sharing OCR over the local network.
 
 ## Features
 
-- **Batch OCR** — Pick or drag-drop multiple images, run OCR on all of them
-- **Parallel processing** — Processes up to 4 images concurrently on the ANE
-  (Apple Neural Engine) via `withTaskGroup`, maximizing throughput
-- **Live timer** — Shows elapsed time during processing
-- **Paragraph reconstruction** — Uses Vision bounding boxes to preserve original
-  document layout (paragraph grouping via Y-position thresholds)
-- **File dropdown** — Browse per-file results via dropdown on both native and web UI
+- **Batch OCR** — Drag & drop images or folders (PNG, JPG, GIF, BMP, TIFF, HEIC,
+  WebP, **PDF**) and run OCR on all of them
+- **PDF support** — Each PDF page rendered at 200 DPI and OCR'd as its own result
+  entry (`file.pdf (page N)`)
+- **macOS 26 Document Intelligence** — Uses `RecognizeDocumentsRequest` where
+  available for native paragraph / table / list structure; falls back to
+  bounding-box reconstruction on older systems
+- **Parallel processing** — Up to 4 concurrent Vision requests on the ANE
+  (`clampedConcurrency` keeps the working set under the 32MB SRAM budget)
+- **Live timer** — Elapsed time shown during processing
+- **File dropdown** — Browse per-file results via dropdown on native and web UI
 - **Copy & Save** — Copy individual file text, copy all, save all as `.txt`
 - **Clear** — Reset to initial state
-- **Network Server** — Start an in-process HTTP server, upload images from any
-  browser on your local network, browse results per-file
+- **Network Server** — In-process HTTP server; upload from any browser on your
+  local network, browse per-file results
+- **History tab** — Records past OCR runs
 - **Dark mode** — System-adaptive colors throughout
 
 ## Performance
@@ -29,79 +34,73 @@ Measured on **Apple M3 Pro** — 467 screenshots (mixed formats):
 | Fast, parallel | 9.0s | 51.7 img/s | 0.08s | ~58% |
 
 **Accurate + parallel** is the recommended mode — 3× faster than sequential
-with no accuracy loss. Parallelism exploits the ANE's ability to handle
-multiple Core ML requests concurrently (research-backed: S4 MLX batch scaling,
-S1 ANE architecture).
-
-Fast mode is useful for pre-screening but misses ~40% of text on screenshots.
+with no accuracy loss. Fast mode is useful for pre-screening but misses ~40%
+of text on screenshots. See `docs/ANE_ENGINEERING_RULESET.md` for the ANE
+constraints behind these settings.
 
 ## Quick Start
 
-### Build & Run (development)
-
-Open `OCR-App.xcodeproj` in Xcode (macOS 15+), then **Cmd+R** or Product → Run.
-
-### Build for production
+### Build with the script (no Xcode UI needed)
 
 ```bash
-xcodebuild -project OCR-App.xcodeproj -scheme "OCR App" build -configuration Release -derivedDataPath /tmp/OCR-App-Build
+./build.sh                 # release → ./dist/OCR App.app
+./build.sh --debug         # debug build
+./build.sh --open          # build then launch
+./build.sh --output ~/Desktop   # custom output dir
 ```
 
-The built app is at:
-```
-/tmp/OCR-App-Build/Build/Products/Release/OCR App.app
-```
+### Build in Xcode (development)
 
-Copy to Applications:
-```bash
-cp -R "/tmp/OCR-App-Build/Build/Products/Release/OCR App.app" /Applications/
-```
+Open `OCR-App.xcodeproj` in Xcode (macOS 15+), then **Cmd+R**.
 
-> **Note:** The app is ad-hoc signed. On other Macs, right-click → Open to bypass
-> Gatekeeper. For proper distribution without warnings, sign with an Apple
-> Developer ID certificate and notarize.
+> **Note:** The app is ad-hoc signed. On other Macs, right-click → Open to
+> bypass Gatekeeper. For proper distribution, sign with an Apple Developer ID
+> certificate and notarize.
 
 ## Usage
 
 ### GUI App
-1. **Pick Image(s)** button or **drag & drop** files onto the window
-2. Click **Run OCR** — live timer shows progress
+
+1. **Drag & drop** files or folders onto the window
+2. Click **Run OCR** in the "ready" card (or press ⏎) — live timer shows progress
 3. Browse results via **file dropdown** — select a file to view its text
-4. **Copy** individual text, **Copy All**, or **Save as .txt**
-5. **Clear All** to reset
+4. **Copy** individual text, **Copy All**, or **Save .txt**
+5. **✕ Clear All** to reset
+6. Use the **Fast mode** checkbox for quick pre-screening (~6× faster, may miss text)
 
 ### Network Server
-1. Launch the app and click **Start Server** (bottom of the window)
-2. The app shows the server address (e.g. `http://192.168.2.6:8080`)
-3. Open that address from any device on your network
-4. Select files → tap **Run OCR** — results page shows dropdown + per-file output
-5. **💾 Save All** downloads all results
-6. **📋 Copy** copies the currently selected file's text
-7. **✕ Clear** to go back
 
-For JSON or plain-text output, append `?format=json` or `?format=txt` to the
-OCR endpoint. For fast mode (pre-screening), use `?fast=1`.
+1. Go to the **Server** tab and click **Start Server**
+2. The app shows the address (e.g. `http://192.168.2.6:8080`)
+3. Open it from any device on your network
+4. Select files → tap **Run OCR** — results page shows dropdown + per-file output
+5. **💾 Save All** / **📋 Copy** / **✕ Clear**
+
+API details in [`API.md`](API.md). Notable options:
+- `?format=json` or `?format=txt` — output format
+- `?fast=1` — fast recognition mode
+- Uploads over **250MB** are rejected (HTTP 413)
 
 ### CLI Benchmark
 
 ```bash
 cd OCRBenchmark
-swift package clean 2>&1
+swift package clean 2>&1   # once, after moving directories
 
-# Accurate + parallel (default, recommended — 3× faster than sequential)
+# Accurate + parallel (default, recommended)
 swift run -c release OCRBenchmark ~/Screenshots
 
-# Fast + parallel (pre-screening, ~6× faster, may miss text)
+# Fast + parallel (pre-screening)
 swift run -c release OCRBenchmark ~/Screenshots --fast
 
-# Accurate + sequential (baseline for comparison)
+# Accurate + sequential (baseline)
 swift run -c release OCRBenchmark ~/Screenshots --sequential
 
 # JSON output
 swift run -c release OCRBenchmark ~/Screenshots --json results.json
 ```
 
-For repeated runs with stats:
+Repeated runs with stats:
 ```bash
 ./tools/batch_benchmark.sh ~/Screenshots
 ```
@@ -109,40 +108,48 @@ For repeated runs with stats:
 ## Project Structure
 
 ```
-├── OCR-App/                     # macOS GUI application
-│   ├── AppDelegate.swift        # Application entry point
-│   ├── ViewController.swift     # Main UI (file picker, drag-drop, results)
+├── build.sh                     # Build .app from the terminal
+├── OCR-App/                     # macOS GUI application (SwiftUI)
+│   ├── OCR_App.swift            # App entry point
+│   ├── ContentView.swift        # Tab container (OCR / Server / History)
+│   ├── OCRTabView.swift         # OCR tab UI (drop, run, results)
+│   ├── OCRViewModel.swift       # OCR state + actions
+│   ├── ServerTabView.swift      # Server tab UI
+│   ├── ServerViewModel.swift    # Server state
+│   ├── HistoryTabView.swift     # History tab
 │   ├── ServerManager.swift      # Embedded HTTP server (BSD sockets + GCD)
-│   └── OCRService.swift         # Vision OCR logic with parallel processing
+│   └── OCRService.swift         # Vision OCR + PDF rendering + ANE tuning
 ├── OCR-App.xcodeproj/           # Xcode project
 ├── OCRBenchmark/                # CLI benchmark tool (Swift Package)
-│   ├── Package.swift
-│   └── Sources/
+├── docs/
+│   └── ANE_ENGINEERING_RULESET.md  # ANE/Vision constraints for agents
+├── API.md                       # HTTP API documentation
 └── tools/
     └── batch_benchmark.sh       # Multi-run benchmark wrapper
 ```
 
 ## Requirements
 
-- macOS 15+ (required for `RecognizeTextRequest`)
+- macOS 15+ (macOS 26 recommended for Document Intelligence)
 - Xcode 16+
 - Swift 6.0+ (for CLI tools)
 
 ## Supported Formats
 
-PNG, JPG, JPEG, GIF, BMP, TIFF, TIF, HEIC, WebP
+PNG, JPG, JPEG, GIF, BMP, TIFF, TIF, HEIC, WebP, PDF
 
 ## Research Basis
 
-Speed optimizations are informed by recent research into the Apple Neural
-Engine and on-device OCR performance:
+Speed optimizations are informed by research into the Apple Neural Engine and
+on-device OCR:
 
-- **S1** (ANE architecture, arXiv 2606.22283): Confirms Vision API routes
-  through Core ML → ANE. Documents ANE throughput/energy roofline on M-series
-  chips including M3 Pro.
-- **S2** (OCR→Core ML case study, Hugging Face 2025): Reports ANE is ~12×
-  more power-efficient than CPU and ~4× more efficient than GPU for OCR.
-- **S3** (practitioner report): Vision framework OCR achieves ~99% perceived
-  accuracy, significantly outperforming VLM-based pipelines.
+- **S1** (ANE architecture, arXiv 2606.22283): Vision routes through Core ML →
+  ANE; documents ANE roofline on M-series including M3 Pro.
+- **S2** (OCR→Core ML case study, Hugging Face 2025): ANE is ~12× more
+  power-efficient than CPU and ~4× more efficient than GPU for OCR.
+- **S3** (practitioner report): Vision OCR achieves ~99% perceived accuracy.
 - **S4** (MLX batch scaling, arXiv 2510.18921): Apple Silicon shows sub-linear
   latency scaling with batch size, motivating parallel processing.
+- **ANE ruleset**: 32MB SRAM working-set budget, 2–4 concurrency band,
+  200 DPI PDF rendering, 250MB ingest limit — implemented and documented in
+  `docs/ANE_ENGINEERING_RULESET.md`.
