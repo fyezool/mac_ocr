@@ -141,22 +141,8 @@ public enum OCRService {
             return (index, OCRItem(filename: url.lastPathComponent, text: "", error: "Could not load image", duration: elapsed))
         }
 
-        var request = RecognizeTextRequest()
-        request.recognitionLevel = config.recognitionLevel
-        request.usesLanguageCorrection = config.usesLanguageCorrection
-        request.automaticallyDetectsLanguage = config.automaticallyDetectsLanguage
-
-        if !config.recognitionLanguages.isEmpty {
-            request.recognitionLanguages = config.recognitionLanguages
-        }
-
-        if !config.customWords.isEmpty {
-            request.customWords = config.customWords
-        }
-
         do {
-            let observations = try await request.perform(on: imageData)
-            let text = reconstructParagraphs(from: observations)
+            let text = try await recognizeText(in: imageData, config: config)
             let elapsed = CFAbsoluteTimeGetCurrent() - start
             return (index, OCRItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed))
         } catch {
@@ -165,10 +151,70 @@ public enum OCRService {
         }
     }
 
+    /// Recognize text from image data using the best available Vision API.
+    /// macOS 26+ uses `RecognizeDocumentsRequest` (native paragraph/table/list
+    /// layout); older systems use `RecognizeTextRequest` + bounding-box
+    /// paragraph reconstruction. Fast mode always uses the legacy `.fast` path.
+    private static func recognizeText(in data: Data, config: OCRConfiguration) async throws -> String {
+        if #available(macOS 26.0, *), config.recognitionLevel != .fast {
+            do {
+                let request = RecognizeDocumentsRequest()
+                let observations = try await request.perform(on: data)
+                if let doc = observations.first?.document, !doc.text.transcript.isEmpty {
+                    return reconstructDocumentText(from: doc)
+                }
+            } catch {
+                // Fall through to the legacy path below.
+            }
+        }
+
+        var request = RecognizeTextRequest()
+        request.recognitionLevel = config.recognitionLevel
+        request.usesLanguageCorrection = config.usesLanguageCorrection
+        request.automaticallyDetectsLanguage = config.automaticallyDetectsLanguage
+        if !config.recognitionLanguages.isEmpty { request.recognitionLanguages = config.recognitionLanguages }
+        if !config.customWords.isEmpty { request.customWords = config.customWords }
+        let observations = try await request.perform(on: data)
+        return reconstructParagraphs(from: observations)
+    }
+
+    /// Convert a document observation's native structure into layout-preserving
+    /// text: paragraphs separated by blank lines, table cells by ` | `, list
+    /// items keep their markers.
+    @available(macOS 26.0, *)
+    private static func reconstructDocumentText(from doc: DocumentObservation.Container) -> String {
+        var parts: [String] = []
+
+        if let title = doc.title, !title.transcript.isEmpty {
+            parts.append(title.transcript)
+        }
+        for paragraph in doc.paragraphs where !paragraph.transcript.isEmpty {
+            parts.append(paragraph.transcript)
+        }
+        for table in doc.tables {
+            var rows: [String] = []
+            for row in table.rows {
+                rows.append(row.map { $0.content.text.transcript }.joined(separator: " | "))
+            }
+            if !rows.isEmpty { parts.append(rows.joined(separator: "\n")) }
+        }
+        for list in doc.lists {
+            for item in list.items {
+                let marker = item.markerString.isEmpty ? "•" : item.markerString
+                parts.append("\(marker) \(item.itemString)")
+            }
+        }
+
+        return parts.filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+
     /// Reconstruct paragraphs from Vision text observations using bounding-box
     /// positions with adaptive thresholds based on median line height.
     /// Process a PDF document: render each page to an image and run Vision OCR
     /// on it. Each page becomes its own OCRItem (named `file.pdf (page N)`).
+    ///
+    /// Pages are processed sequentially to keep ANE working set / RSS bounded,
+    /// and each page's render artifacts are released via `autoreleasepool`.
     private static func processPDF(_ url: URL, config: OCRConfiguration) async -> [OCRItem] {
         guard let doc = PDFDocument(url: url) else {
             return [OCRItem(filename: url.lastPathComponent, text: "", error: "Could not load PDF", duration: 0)]
@@ -178,32 +224,35 @@ public enum OCRService {
         items.reserveCapacity(doc.pageCount)
 
         for pageIndex in 0..<doc.pageCount {
-            guard let page = doc.page(at: pageIndex) else { continue }
             let pageStart = CFAbsoluteTimeGetCurrent()
             let pageName = "\(url.lastPathComponent) (page \(pageIndex + 1))"
 
-            let bounds = page.bounds(for: .mediaBox)
-            let size = CGSize(width: bounds.width * 2, height: bounds.height * 2)
-            let thumbnail = page.thumbnail(of: size, for: .mediaBox)
-
-            guard let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil),
-                  let pngData = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
-            else {
+            // 150–200 DPI sweet spot, capped at 4096px longest side.
+            let pngData: Data
+            do {
+                pngData = try autoreleasepool { () throws -> Data in
+                    guard let page = doc.page(at: pageIndex) else {
+                        throw NSError(domain: "OCR", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing page \(pageIndex + 1)"])
+                    }
+                    let bounds = page.bounds(for: .mediaBox)
+                    let scale = renderScale(for: bounds)
+                    let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+                    let thumbnail = page.thumbnail(of: size, for: .mediaBox)
+                    guard let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                          let data = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
+                    else {
+                        throw NSError(domain: "OCR", code: 2, userInfo: [NSLocalizedDescriptionKey: "Could not render page \(pageIndex + 1)"])
+                    }
+                    return data
+                }
+            } catch {
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
-                items.append(OCRItem(filename: pageName, text: "", error: "Could not render page", duration: elapsed))
+                items.append(OCRItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed))
                 continue
             }
 
-            var request = RecognizeTextRequest()
-            request.recognitionLevel = config.recognitionLevel
-            request.usesLanguageCorrection = config.usesLanguageCorrection
-            request.automaticallyDetectsLanguage = config.automaticallyDetectsLanguage
-            if !config.recognitionLanguages.isEmpty { request.recognitionLanguages = config.recognitionLanguages }
-            if !config.customWords.isEmpty { request.customWords = config.customWords }
-
             do {
-                let observations = try await request.perform(on: pngData)
-                let text = reconstructParagraphs(from: observations)
+                let text = try await recognizeText(in: pngData, config: config)
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
                 items.append(OCRItem(filename: pageName, text: text, error: nil, duration: elapsed))
             } catch {
@@ -213,6 +262,16 @@ public enum OCRService {
         }
 
         return items
+    }
+
+    /// Scale that lands in the 150–200 DPI rasterization sweet spot, capped so
+    /// the longest rendered side never exceeds `maxPixelSide` (~4096px).
+    private static func renderScale(for bounds: CGRect, maxPixelSide: CGFloat = 4096) -> CGFloat {
+        let dpi = CGFloat(200) / 72   // 200 DPI target
+        let longestSide = max(bounds.width, bounds.height)
+        let scaled = longestSide * dpi
+        if scaled <= maxPixelSide { return dpi }
+        return maxPixelSide / longestSide
     }
 
     private static func reconstructParagraphs(from observations: [RecognizedTextObservation]) -> String {

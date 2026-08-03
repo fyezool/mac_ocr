@@ -9,6 +9,7 @@ final class OCRViewModel: ObservableObject {
     @Published var files: [URL] = []
     @Published var results: [OCRItem]?
     @Published var isBusy = false
+    @Published var isCollecting = false
     @Published var errorMessage: String?
     @Published var elapsed: TimeInterval = 0
     @Published var isFastMode = false

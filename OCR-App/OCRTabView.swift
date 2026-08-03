@@ -14,8 +14,16 @@ struct OCRTabView: View {
                     progressSection
                 }
 
+                if app.isCollecting {
+                    collectingSection
+                }
+
                 if app.hasError, let err = app.errorMessage {
                     errorSection(err)
+                }
+
+                if app.hasFiles && !app.hasResults && !app.hasError {
+                    readySection
                 }
 
                 if app.hasResults {
@@ -54,6 +62,20 @@ struct OCRTabView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
+        }
+        .frame(maxWidth: .infinity)
+        .padding()
+    }
+
+    // MARK: - Collecting
+
+    private var collectingSection: some View {
+        VStack(spacing: 8) {
+            ProgressView()
+                .scaleEffect(0.8)
+            Text("Reading files…")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
         .padding()
@@ -160,6 +182,45 @@ struct OCRTabView: View {
         )
     }
 
+    // MARK: - Ready (files loaded, not yet processed)
+
+    private var readySection: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 6) {
+                Image(systemName: "doc.badge.plus")
+                    .foregroundStyle(.secondary)
+                Text("\(app.fileCount) file(s) loaded")
+                    .font(.headline)
+            }
+
+            HStack(spacing: 10) {
+                Toggle("Fast mode (~3× faster)", isOn: $app.isFastMode)
+                    .toggleStyle(.checkbox)
+                    .font(.subheadline)
+
+                Spacer()
+
+                Button {
+                    app.runOCR()
+                } label: {
+                    Label("Run OCR", systemImage: "text.viewfinder")
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 4)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.return, modifiers: [])
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity)
+        .background(.fill.quinary)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(.separator, lineWidth: 1)
+        )
+    }
+
     // MARK: - Empty state
 
     private var emptyState: some View {
@@ -201,35 +262,50 @@ struct OCRTabView: View {
     // MARK: - Drop handling
 
     private func handleDrop(providers: [NSItemProvider]) {
-        var pending = providers.count
-        guard pending > 0 else { return }
-        var urls: [URL] = []
-        let lock = NSLock()
+        guard !providers.isEmpty else { return }
+        app.isCollecting = true
 
-        for provider in providers {
-            provider.loadObject(ofClass: NSURL.self) { item, _ in
-                let url = (item as? NSURL) as? URL
-                lock.lock()
-                if let url { urls.append(url) }
-                pending -= 1
-                let done = (pending == 0)
-                lock.unlock()
+        Task {
+            // Load URLs off the main thread — loadObject can deadlock if we
+            // block the main run loop while waiting for its completion.
+            var urls: [URL] = []
+            for provider in providers {
+                if let url = await Self.loadURL(from: provider) {
+                    urls.append(url)
+                }
+            }
+            guard !urls.isEmpty else {
+                await MainActor.run { self.app.isCollecting = false }
+                return
+            }
 
-                if done {
-                    var all: [URL] = []
-                    for u in urls {
-                        var isDir: ObjCBool = false
-                        FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir)
-                        if isDir.boolValue {
-                            all.append(contentsOf: OCRService.collectImages(from: u))
-                        } else {
-                            all.append(u)
-                        }
-                    }
-                    DispatchQueue.main.async {
-                        self.app.addURLs(all)
+            // Expand any dropped folders on a background executor, never main.
+            let all = await Task.detached(priority: .userInitiated) {
+                var result: [URL] = []
+                for u in urls {
+                    var isDir: ObjCBool = false
+                    FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir)
+                    if isDir.boolValue {
+                        result.append(contentsOf: OCRService.collectImages(from: u))
+                    } else {
+                        result.append(u)
                     }
                 }
+                return result
+            }.value
+
+            await MainActor.run {
+                self.app.isCollecting = false
+                self.app.addURLs(all)
+            }
+        }
+    }
+
+    /// Load a file URL from an item provider without blocking the caller.
+    private static func loadURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { continuation in
+            provider.loadObject(ofClass: NSURL.self) { item, _ in
+                continuation.resume(returning: (item as? NSURL) as? URL)
             }
         }
     }
