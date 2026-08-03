@@ -1,5 +1,6 @@
 import Foundation
 import Vision
+import PDFKit
 
 // MARK: - OCR Result Model
 
@@ -63,30 +64,40 @@ enum OCRService {
         if fast { cfg.recognitionLevel = .fast }
         let maxConcurrent = min(paths.count, cfg.maxConcurrency)
 
-        return await withTaskGroup(of: (Int, OCRItem).self) { group in
+        return await withTaskGroup(of: (Int, [OCRItem]).self) { group in
             var index = 0
-            var results = [OCRItem?](repeating: nil, count: paths.count)
+            var slots = [[OCRItem]?](repeating: nil, count: paths.count)
 
             // Submit initial batch
             for i in 0..<maxConcurrent {
                 let c = cfg
-                group.addTask { await processOne(paths[i], index: i, config: c) }
+                group.addTask { await processPath(paths[i], index: i, config: c) }
             }
             index = maxConcurrent
 
             // As each task completes, submit the next one
-            for await (idx, item) in group {
-                results[idx] = item
+            for await (idx, items) in group {
+                slots[idx] = items
                 if index < paths.count {
                     let nextIdx = index
                     let c = cfg
-                    group.addTask { await processOne(paths[nextIdx], index: nextIdx, config: c) }
+                    group.addTask { await processPath(paths[nextIdx], index: nextIdx, config: c) }
                     index += 1
                 }
             }
 
-            return results.compactMap { $0 }
+            return slots.compactMap { $0 }.flatMap { $0 }
         }
+    }
+
+    /// Dispatch a single path to image or PDF processing based on extension.
+    private static func processPath(_ path: String, index: Int, config: OCRConfiguration) async -> (Int, [OCRItem]) {
+        let url = URL(fileURLWithPath: path)
+        if url.pathExtension.lowercased() == "pdf" {
+            return (index, await processPDF(url, config: config))
+        }
+        let single = await processOne(path, index: index, config: config)
+        return (index, [single.1])
     }
 
     /// Process a single image through Vision OCR, reconstructing paragraphs
@@ -133,6 +144,56 @@ enum OCRService {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
             return (index, OCRItem(filename: url.lastPathComponent, text: "", error: error.localizedDescription, duration: elapsed))
         }
+    }
+
+    /// Process a PDF document: render each page to an image and run Vision OCR
+    /// on it. Each page becomes its own OCRItem (named `file.pdf (page N)`),
+    /// so multi-page PDFs appear as separate entries in the results dropdown.
+    private static func processPDF(_ url: URL, config: OCRConfiguration) async -> [OCRItem] {
+        guard let doc = PDFDocument(url: url) else {
+            return [OCRItem(filename: url.lastPathComponent, text: "", error: "Could not load PDF", duration: 0)]
+        }
+
+        var items: [OCRItem] = []
+        items.reserveCapacity(doc.pageCount)
+
+        for pageIndex in 0..<doc.pageCount {
+            guard let page = doc.page(at: pageIndex) else { continue }
+            let pageStart = CFAbsoluteTimeGetCurrent()
+            let pageName = "\(url.lastPathComponent) (page \(pageIndex + 1))"
+
+            // Render page at 2x resolution for good OCR fidelity.
+            let bounds = page.bounds(for: .mediaBox)
+            let size = CGSize(width: bounds.width * 2, height: bounds.height * 2)
+            let thumbnail = page.thumbnail(of: size, for: .mediaBox)
+
+            guard let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                  let pngData = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
+            else {
+                let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
+                items.append(OCRItem(filename: pageName, text: "", error: "Could not render page", duration: elapsed))
+                continue
+            }
+
+            var request = RecognizeTextRequest()
+            request.recognitionLevel = config.recognitionLevel
+            request.usesLanguageCorrection = config.usesLanguageCorrection
+            request.automaticallyDetectsLanguage = config.automaticallyDetectsLanguage
+            if !config.recognitionLanguages.isEmpty { request.recognitionLanguages = config.recognitionLanguages }
+            if !config.customWords.isEmpty { request.customWords = config.customWords }
+
+            do {
+                let observations = try await request.perform(on: pngData)
+                let text = reconstructParagraphs(from: observations)
+                let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
+                items.append(OCRItem(filename: pageName, text: text, error: nil, duration: elapsed))
+            } catch {
+                let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
+                items.append(OCRItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed))
+            }
+        }
+
+        return items
     }
 
     /// Reconstruct paragraphs from Vision text observations using bounding-box
@@ -203,7 +264,7 @@ enum OCRService {
 
     static func collectImages(from directory: URL) -> [URL] {
         let imageExtensions: Set<String> = [
-            "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "webp"
+            "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "webp", "pdf"
         ]
         var images: [URL] = []
 
@@ -227,6 +288,6 @@ enum OCRService {
     }
 
     static let supportedImageExtensions: [String] = [
-        "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "webp"
+        "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "webp", "pdf"
     ]
 }

@@ -500,7 +500,7 @@ private let webHTML = """
     <div class="zone" id="dz">
       <span class="zone-icon" aria-hidden="true">📁</span>
       <p>Drag &amp; drop images here</p>
-      <p class="hint">PNG, JPG, GIF, BMP, TIFF, HEIC, WebP</p>
+      <p class="hint">PNG, JPG, GIF, BMP, TIFF, HEIC, WebP, PDF</p>
       <div id="cnt" aria-live="polite" style="font-size:13px;font-weight:600;margin-top:10px;color:var(--accent)"></div>
     </div>
 
@@ -521,7 +521,7 @@ private let webHTML = """
         st=document.getElementById('st'),fast=document.getElementById('fast'),
         sp=document.getElementById('spinner'),form=document.getElementById('ocr-form');
   let sel=[];
-  const exts=new Set(['png','jpg','jpeg','gif','bmp','tiff','tif','heic','webp']);
+  const exts=new Set(['png','jpg','jpeg','gif','bmp','tiff','tif','heic','webp','pdf']);
 
   // Drag only — no click picker
   dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover')},{passive:false});
