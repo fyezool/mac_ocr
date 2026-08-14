@@ -97,6 +97,11 @@ notarization.
 4. Select files or take a photo → tap **Run OCR** — results page shows dropdown + per-file output
 5. **💾 Save All** / **📋 Copy** / **✕ Clear**
 
+> **⚠️ Security:** the LAN server has **no authentication**. Anyone who can
+> reach the listening interface can submit files for OCR. Use it only on
+> networks you trust, and expose it externally only through your own reverse
+> proxy (e.g. OPNsense) with access control.
+
 API details in [`API.md`](API.md). Notable options:
 - `?format=json` or `?format=txt` — output format
 - `?fast=1` — fast recognition mode
@@ -130,6 +135,9 @@ swift run -c release OCRBenchmark ~/Screenshots --resize-sweep --references ~/gt
 # benchmarked against always-accurate (throughput, p95, CER/WER)
 swift run -c release OCRBenchmark ~/Screenshots --adaptive --json adaptive.json
 
+# Sweep the adaptive threshold (0.50–0.95) to find the accuracy/latency frontier
+swift run -c release OCRBenchmark ~/Screenshots --adaptive-sweep --references ~/gt --json adapt_sweep.json
+
 # Languages / engine pinning / downscaling
 swift run -c release OCRBenchmark ~/Screenshots --lang ms-MY,en-US --json results.json
 swift run -c release OCRBenchmark ~/Screenshots --legacy-engine --json results.json
@@ -143,13 +151,15 @@ swift run -c release OCRBenchmark ~/Screenshots --json results.json
 ```
 
 Benchmark JSON now records the environment (OS, device model, SoC, RAM), the OCR
-configuration (recognition level, languages, concurrency, Vision revision,
-engine pinning), per-file latency percentiles (p50/p95/p99), and — with
-`--references` — CER/WER/exact match against ground truth. `--sweep` and
-`--resize-sweep` expose concurrency and input resolution as measured dimensions
-instead of assuming the hard-coded defaults are optimal. `--legacy-engine`
-forces the `RecognizeTextRequest` path even on macOS 26 so engine-dependent
-comparisons stay apples-to-apples.
+configuration (recognition level, languages, concurrency with requested vs
+effective values and safety ceiling, Vision revision, engine pinning), per-file
+latency percentiles (p50/p95/p99), and — with `--references` — both **macro**
+and **micro** (corpus-level) CER/WER plus exact match. `--sweep`,
+`--resize-sweep`, and `--adaptive-sweep` expose concurrency, input resolution,
+and the adaptive retry threshold as measured dimensions instead of assuming the
+hard-coded defaults are optimal. `--legacy-engine` forces the
+`RecognizeTextRequest` path even on macOS 26 so engine-dependent comparisons
+stay apples-to-apples.
 
 Repeated runs with stats:
 ```bash

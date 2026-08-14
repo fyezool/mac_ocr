@@ -19,21 +19,33 @@ public struct OCRItem: Codable, Sendable {
     }
 }
 
-/// A result that also carries the mean recognition confidence of the text
-/// observations, used to drive the adaptive fast→accurate routing.
+/// Per-item confidence statistics used to drive adaptive routing. Mean alone
+/// can hide a few catastrophic blocks, so min + low-ratio are also reported.
+public struct ConfidenceStats: Codable, Sendable {
+    public let mean: Double?
+    public let min: Double?
+    public let lowRatio: Double?
+}
+
+/// A result that also carries recognition confidence statistics, used to drive
+/// the adaptive fast→accurate routing.
 public struct OCRDetailedItem: Codable, Sendable {
     public let filename: String
     public let text: String
     public let error: String?
     public let duration: TimeInterval
     public let meanConfidence: Double?
+    public let minConfidence: Double?
+    public let lowConfidenceRatio: Double?
 
-    public init(filename: String, text: String, error: String?, duration: TimeInterval, meanConfidence: Double?) {
+    public init(filename: String, text: String, error: String?, duration: TimeInterval, meanConfidence: Double?, minConfidence: Double? = nil, lowConfidenceRatio: Double? = nil) {
         self.filename = filename
         self.text = text
         self.error = error
         self.duration = duration
         self.meanConfidence = meanConfidence
+        self.minConfidence = minConfidence
+        self.lowConfidenceRatio = lowConfidenceRatio
     }
 }
 
@@ -236,18 +248,19 @@ public enum OCRService {
         }
 
         do {
-            let (text, confidence) = try await recognizeTextWithConfidence(in: imageData, config: config)
+            let (text, stats) = try await recognizeTextWithConfidence(in: imageData, config: config)
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            return (index, OCRDetailedItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed, meanConfidence: confidence))
+            return (index, OCRDetailedItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed, meanConfidence: stats.mean, minConfidence: stats.min, lowConfidenceRatio: stats.lowRatio))
         } catch {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
             return (index, OCRDetailedItem(filename: url.lastPathComponent, text: "", error: error.localizedDescription, duration: elapsed, meanConfidence: nil))
         }
     }
 
-    /// Probe path: always uses `RecognizeTextRequest` and returns the mean
-    /// confidence of non-empty observations alongside the reconstructed text.
-    private static func recognizeTextWithConfidence(in data: Data, config: OCRConfiguration) async throws -> (String, Double?) {
+    /// Probe path: always uses `RecognizeTextRequest` and returns the
+    /// reconstructed text plus confidence statistics of the non-empty
+    /// observations.
+    private static func recognizeTextWithConfidence(in data: Data, config: OCRConfiguration) async throws -> (String, ConfidenceStats) {
         var request = RecognizeTextRequest()
         request.recognitionLevel = config.recognitionLevel
         request.usesLanguageCorrection = config.usesLanguageCorrection
@@ -256,7 +269,7 @@ public enum OCRService {
         if !config.customWords.isEmpty { request.customWords = config.customWords }
         let observations = try await request.perform(on: data)
         let result = reconstructParagraphsWithConfidence(from: observations)
-        return (result.text, result.meanConfidence)
+        return (result.text, result.stats)
     }
 
     /// Dispatch a single path to image or PDF processing based on extension.
@@ -413,9 +426,9 @@ public enum OCRService {
             }
 
             do {
-                let (text, confidence) = try await recognizeTextWithConfidence(in: pngData, config: config)
+                let (text, stats) = try await recognizeTextWithConfidence(in: pngData, config: config)
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
-                items.append(OCRDetailedItem(filename: pageName, text: text, error: nil, duration: elapsed, meanConfidence: confidence))
+                items.append(OCRDetailedItem(filename: pageName, text: text, error: nil, duration: elapsed, meanConfidence: stats.mean, minConfidence: stats.min, lowConfidenceRatio: stats.lowRatio))
             } catch {
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
                 items.append(OCRDetailedItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed, meanConfidence: nil))
@@ -461,8 +474,8 @@ public enum OCRService {
 
     /// Same layout reconstruction as `reconstructParagraphs`, additionally
     /// returning the mean confidence of the recognized text observations.
-    private static func reconstructParagraphsWithConfidence(from observations: [RecognizedTextObservation]) -> (text: String, meanConfidence: Double?) {
-        guard !observations.isEmpty else { return ("", nil) }
+    private static func reconstructParagraphsWithConfidence(from observations: [RecognizedTextObservation]) -> (text: String, stats: ConfidenceStats) {
+        guard !observations.isEmpty else { return ("", ConfidenceStats(mean: nil, min: nil, lowRatio: nil)) }
 
         // Adaptive threshold from median line height
         let heights = observations.map { $0.boundingBox.height }
@@ -512,8 +525,12 @@ public enum OCRService {
             lastX = centerX
         }
 
-        let meanConfidence = confidences.isEmpty ? nil : Double(confidences.reduce(0.0) { $0 + Double($1) } / Double(confidences.count))
-        return (result, meanConfidence)
+        let stats = ConfidenceStats(
+            mean: confidences.isEmpty ? nil : Double(confidences.reduce(0.0) { $0 + Double($1) } / Double(confidences.count)),
+            min: confidences.min().map(Double.init),
+            lowRatio: confidences.isEmpty ? nil : Double(confidences.filter { $0 < 0.5 }.count) / Double(confidences.count)
+        )
+        return (result, stats)
     }
 
     public static func collectImages(from directory: URL) -> [URL] {

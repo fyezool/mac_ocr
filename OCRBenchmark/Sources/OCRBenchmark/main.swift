@@ -17,6 +17,7 @@ struct OCRBenchmark {
         var concurrency: Int?
         var sweep = false
         var adaptive = false
+        var adaptiveSweep = false
         var adaptiveThreshold = 0.75
         var languages: [String]?
         var legacyEngine = false
@@ -29,7 +30,11 @@ struct OCRBenchmark {
     struct AccuracySummary {
         var compared = 0
         var cerSum = 0.0
+        var cerDistSum = 0
+        var cerRefSum = 0
         var werSum = 0.0
+        var werDistSum = 0
+        var werRefSum = 0
         var exactSum = 0.0
         var perFile: [[String: Any]] = []
     }
@@ -68,6 +73,10 @@ struct OCRBenchmark {
             print("❌ --resize-sweep cannot be combined with --sweep/--adaptive/--sequential.")
             exit(1)
         }
+        if opts.adaptiveSweep && (opts.adaptive || opts.sweep || opts.resizeSweep || opts.useSequential) {
+            print("❌ --adaptive-sweep cannot be combined with --adaptive/--sweep/--resize-sweep/--sequential.")
+            exit(1)
+        }
         if opts.resizeSweep && opts.resizeTo != nil {
             print("❌ --resize-sweep and --resize-to are mutually exclusive.")
             exit(1)
@@ -89,6 +98,8 @@ struct OCRBenchmark {
         let levelLabel = opts.useFast ? "fast" : "accurate"
         if opts.resizeSweep {
             await runResizeSweep(images: images, options: opts)
+        } else if opts.adaptiveSweep {
+            await runAdaptiveSweep(images: images, options: opts)
         } else if opts.adaptive {
             await runAdaptive(images: images, options: opts)
         } else if opts.sweep {
@@ -239,71 +250,36 @@ struct OCRBenchmark {
 
     // MARK: - Adaptive cascade
 
-    /// fast probe → retry accurate on low-confidence/empty items, compared
-    /// against an always-accurate baseline on mean throughput, p95, and accuracy.
+    private struct AdaptiveRunResult {
+        var finalItems: [OCRItem] = []
+        var wall: TimeInterval = 0
+        var retriedFiles = 0
+        var accuracy: AccuracySummary?
+        var stats: [String: Any] = [:]
+    }
+
+    /// fast probe → retry accurate on low-confidence items, compared against an
+    /// always-accurate baseline on throughput, p95, and accuracy.
     private static func runAdaptive(images: [URL], options: RunOptions) async {
-        let paths = images.map(\.path)
         let concurrency = options.concurrency ?? 4
         let threshold = options.adaptiveThreshold
         print("🔍 Adaptive OCR (fast probe → retry accurate when confidence < \(threshold)) on \(images.count) image(s)…")
         print(String(repeating: "─", count: 60))
 
-        var fastConfig = OCRConfiguration.default
-        fastConfig.recognitionLevel = .fast
-        applyCommonConfig(&fastConfig, options: options)
-        fastConfig.maxConcurrency = concurrency
-
+        // Baseline: always-accurate
         var accurateConfig = OCRConfiguration.default
         applyCommonConfig(&accurateConfig, options: options)
         accurateConfig.maxConcurrency = concurrency
-
-        // Pass 1: fast probe with per-item mean confidence
-        let totalStart = CFAbsoluteTimeGetCurrent()
-        let fastItems = await OCRService.recognizeTextDetailed(paths: paths, config: fastConfig)
-
-        // Decide which whole files need an accurate retry (any item below threshold)
-        let pathByKey = Dictionary(images.map { (ownerKey($0.lastPathComponent), $0.path) }, uniquingKeysWith: { a, _ in a })
-        var retryPaths = Set<String>()
-        for item in fastItems {
-            guard let path = pathByKey[ownerKey(item.filename)] else { continue }
-            if item.text.isEmpty || (item.meanConfidence ?? 0) < threshold {
-                retryPaths.insert(path)
-            }
-        }
-        let retryList = paths.filter { retryPaths.contains($0) }
-
-        // Pass 2: accurate retry on the retry set
-        var accurateByFilename: [String: OCRItem] = [:]
-        if !retryList.isEmpty {
-            let retryStart = CFAbsoluteTimeGetCurrent()
-            let retryResults = await OCRService.recognizeText(paths: retryList, config: accurateConfig)
-            let retryElapsed = CFAbsoluteTimeGetCurrent() - retryStart
-            print(String(format: "   Fast pass: %8.2fs   retry (accurate): %6.2fs   retried %d/%d files", CFAbsoluteTimeGetCurrent() - totalStart - retryElapsed, retryElapsed, retryPaths.count, images.count))
-            for r in retryResults { accurateByFilename[r.filename] = r }
-        } else {
-            print(String(format: "   Fast pass: %8.2fs   no retries needed", CFAbsoluteTimeGetCurrent() - totalStart))
-        }
-
-        // Build final per-item results (accurate text replaces fast for retried items)
-        var finalItems: [OCRItem] = []
-        for item in fastItems {
-            if let accurate = accurateByFilename[item.filename] {
-                finalItems.append(accurate)
-            } else {
-                finalItems.append(OCRItem(filename: item.filename, text: item.text, error: item.error, duration: item.duration))
-            }
-        }
-        let wall = CFAbsoluteTimeGetCurrent() - totalStart
-
-        // Baseline: always-accurate
         let baseStart = CFAbsoluteTimeGetCurrent()
-        let baseItems = await OCRService.recognizeText(paths: paths, config: accurateConfig)
+        let baseItems = await OCRService.recognizeText(paths: images.map(\.path), config: accurateConfig)
         let baseWall = CFAbsoluteTimeGetCurrent() - baseStart
-
-        let adaptiveStats = runStats(finalItems, wall: wall)
         let baselineStats = runStats(baseItems, wall: baseWall)
-        let accuracyAdaptive = options.referencesDir.map { computeAccuracy(results: finalItems, referencesDir: $0) }
         let accuracyBaseline = options.referencesDir.map { computeAccuracy(results: baseItems, referencesDir: $0) }
+
+        let result = await adaptiveRun(images: images, options: options, threshold: threshold)
+        let wall = result.wall
+        let adaptiveStats = result.stats
+        let accuracyAdaptive = result.accuracy
 
         if options.outputFormat == .table {
             print(String(repeating: "─", count: 60))
@@ -314,8 +290,8 @@ struct OCRBenchmark {
             print("   " + pad("p50 (ms)", 16) + pad(String(format: "%.0f", adaptiveStats["p50_latency_ms"] as? Double ?? 0), 18) + String(format: "%.0f", baselineStats["p50_latency_ms"] as? Double ?? 0))
             print("   " + pad("p95 (ms)", 16) + pad(String(format: "%.0f", adaptiveStats["p95_latency_ms"] as? Double ?? 0), 18) + String(format: "%.0f", baselineStats["p95_latency_ms"] as? Double ?? 0))
             if let a = accuracyAdaptive, let b = accuracyBaseline, a.compared > 0, b.compared > 0 {
-                print("   " + pad("CER (%)", 16) + pad(String(format: "%.2f", a.cerSum / Double(a.compared) * 100), 18) + String(format: "%.2f", b.cerSum / Double(b.compared) * 100))
-                print("   " + pad("WER (%)", 16) + pad(String(format: "%.2f", a.werSum / Double(a.compared) * 100), 18) + String(format: "%.2f", b.werSum / Double(b.compared) * 100))
+                print("   " + pad("CER macro (%)", 16) + pad(String(format: "%.2f", a.cerSum / Double(a.compared) * 100), 18) + String(format: "%.2f", b.cerSum / Double(b.compared) * 100))
+                print("   " + pad("CER micro (%)", 16) + pad(String(format: "%.2f", a.cerRefSum > 0 ? Double(a.cerDistSum) / Double(a.cerRefSum) * 100 : 0), 18) + String(format: "%.2f", b.cerRefSum > 0 ? Double(b.cerDistSum) / Double(b.cerRefSum) * 100 : 0))
             }
             let speedup = wall > 0 ? baseWall / wall : 0
             let verdict = speedup >= 1 ? "adaptive wins" : "baseline wins"
@@ -329,19 +305,127 @@ struct OCRBenchmark {
                 "schema_version": "1.0",
                 "mode": "adaptive",
                 "environment": environmentInfo(),
-                "ocr": [
-                    "recognition_level": "fast+accurate",
-                    "recognition_languages": options.languages ?? ["en-US"],
-                    "concurrency": concurrency,
-                    "adaptive_threshold": threshold,
-                    "force_legacy_engine": options.legacyEngine,
-                    "vision_revision": OCRService.visionRevisionLabel(),
-                ],
-                "retried_files": retryPaths.count,
+                "ocr": ocrInfo(level: "fast+accurate", concurrency: concurrency, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
+                "adaptive_threshold": threshold,
+                "retried_files": result.retriedFiles,
                 "total_files": images.count,
                 "adaptive": adaptive,
                 "baseline_accurate": baseline,
                 "speedup_wall_x": wall > 0 ? baseWall / wall : 0,
+            ]
+            emitJSON(output, path: options.jsonPath)
+        }
+    }
+
+    /// One adaptive run at a given retry threshold. Retry rule: empty text,
+    /// mean confidence below the threshold, any block below 0.4 confidence, or
+    /// more than 25% of blocks below 0.5 confidence.
+    private static func adaptiveRun(images: [URL], options: RunOptions, threshold: Double) async -> AdaptiveRunResult {
+        let paths = images.map(\.path)
+        let concurrency = options.concurrency ?? 4
+
+        var fastConfig = OCRConfiguration.default
+        fastConfig.recognitionLevel = .fast
+        applyCommonConfig(&fastConfig, options: options)
+        fastConfig.maxConcurrency = concurrency
+
+        var accurateConfig = OCRConfiguration.default
+        applyCommonConfig(&accurateConfig, options: options)
+        accurateConfig.maxConcurrency = concurrency
+
+        let totalStart = CFAbsoluteTimeGetCurrent()
+        let fastItems = await OCRService.recognizeTextDetailed(paths: paths, config: fastConfig)
+
+        let pathByKey = Dictionary(images.map { (ownerKey($0.lastPathComponent), $0.path) }, uniquingKeysWith: { a, _ in a })
+        var retryPaths = Set<String>()
+        for item in fastItems {
+            guard let path = pathByKey[ownerKey(item.filename)] else { continue }
+            let lowMean = (item.meanConfidence ?? 0) < threshold
+            let catastrophic = (item.minConfidence ?? 1) < 0.4
+            let manyLow = (item.lowConfidenceRatio ?? 0) > 0.25
+            if item.text.isEmpty || lowMean || catastrophic || manyLow {
+                retryPaths.insert(path)
+            }
+        }
+        let retryList = paths.filter { retryPaths.contains($0) }
+
+        var accurateByFilename: [String: OCRItem] = [:]
+        if !retryList.isEmpty {
+            let retryResults = await OCRService.recognizeText(paths: retryList, config: accurateConfig)
+            for r in retryResults { accurateByFilename[r.filename] = r }
+        }
+
+        var finalItems: [OCRItem] = []
+        for item in fastItems {
+            if let accurate = accurateByFilename[item.filename] {
+                finalItems.append(accurate)
+            } else {
+                finalItems.append(OCRItem(filename: item.filename, text: item.text, error: item.error, duration: item.duration))
+            }
+        }
+        let wall = CFAbsoluteTimeGetCurrent() - totalStart
+
+        var result = AdaptiveRunResult()
+        result.finalItems = finalItems
+        result.wall = wall
+        result.retriedFiles = retryPaths.count
+        result.accuracy = options.referencesDir.map { computeAccuracy(results: finalItems, referencesDir: $0) }
+        result.stats = runStats(finalItems, wall: wall)
+        return result
+    }
+
+    /// Sweep the adaptive retry threshold to find the accuracy/latency Pareto
+    /// frontier instead of assuming a single value.
+    private static func runAdaptiveSweep(images: [URL], options: RunOptions) async {
+        let thresholds = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+        let concurrency = options.concurrency ?? 4
+        print("🔍 Adaptive threshold sweep (fast probe → retry accurate below T) on \(images.count) image(s)…")
+        print(String(repeating: "─", count: 60))
+
+        var accurateConfig = OCRConfiguration.default
+        applyCommonConfig(&accurateConfig, options: options)
+        accurateConfig.maxConcurrency = concurrency
+        let baseStart = CFAbsoluteTimeGetCurrent()
+        let baseItems = await OCRService.recognizeText(paths: images.map(\.path), config: accurateConfig)
+        let baseWall = CFAbsoluteTimeGetCurrent() - baseStart
+        let baselineStats = runStats(baseItems, wall: baseWall)
+        let accuracyBaseline = options.referencesDir.map { computeAccuracy(results: baseItems, referencesDir: $0) }
+
+        print(pad("Thresh", 10) + pad("Retry%", 9) + pad("Wall(s)", 12) + pad("img/s", 9) + pad("p50(ms)", 11) + pad("p95(ms)", 11) + pad("CER%", 9) + "WER%")
+        print(String(repeating: "─", count: 60))
+
+        var runs: [[String: Any]] = []
+        for t in thresholds {
+            let r = await adaptiveRun(images: images, options: options, threshold: t)
+            let retryPct = Double(r.retriedFiles) / Double(max(images.count, 1)) * 100
+            let cer = r.accuracy.map { $0.compared > 0 ? $0.cerSum / Double($0.compared) * 100 : 0 } ?? 0
+            let wer = r.accuracy.map { $0.compared > 0 ? $0.werSum / Double($0.compared) * 100 : 0 } ?? 0
+            print(pad(String(format: "%.2f", t), 10) + pad(String(format: "%.0f", retryPct), 9)
+                + pad(String(format: "%.2f", r.wall), 12) + pad(String(format: "%.1f", r.stats["throughput_items_s"] as? Double ?? 0), 9)
+                + pad(String(format: "%.0f", r.stats["p50_latency_ms"] as? Double ?? 0), 11) + pad(String(format: "%.0f", r.stats["p95_latency_ms"] as? Double ?? 0), 11)
+                + pad(String(format: "%.2f", cer), 9) + String(format: "%.2f", wer))
+
+            var run: [String: Any] = r.stats
+            run["threshold"] = t
+            run["retried_files"] = r.retriedFiles
+            run["retried_ratio"] = retryPct / 100
+            if let accuracy = r.accuracy { run["accuracy"] = accuracyJSON(accuracy) }
+            runs.append(run)
+        }
+
+        var baseline = baselineStats
+        if let accuracyBaseline { baseline["accuracy"] = accuracyJSON(accuracyBaseline) }
+
+        if options.outputFormat == .json {
+            let output: [String: Any] = [
+                "schema_version": "1.0",
+                "mode": "adaptive_sweep",
+                "environment": environmentInfo(),
+                "ocr": ocrInfo(level: "fast+accurate", concurrency: concurrency, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
+                "thresholds": thresholds,
+                "baseline_wall_seconds": baseWall,
+                "runs": runs,
+                "baseline_accurate": baseline,
             ]
             emitJSON(output, path: options.jsonPath)
         }
@@ -438,26 +522,32 @@ struct OCRBenchmark {
             let refPath = (referencesDir as NSString).appendingPathComponent("\(base).txt")
             guard let reference = try? String(contentsOfFile: refPath, encoding: .utf8) else { continue }
 
-            let c = cer(reference: reference, predicted: r.text)
-            let w = wer(reference: reference, predicted: r.text)
+            let c = cerDetail(reference: reference, predicted: r.text)
+            let w = werDetail(reference: reference, predicted: r.text)
             let exact = normalize(reference) == normalize(r.text) ? 1.0 : 0.0
             summary.compared += 1
-            summary.cerSum += c
-            summary.werSum += w
+            summary.cerSum += c.rate
+            summary.cerDistSum += c.dist
+            summary.cerRefSum += c.refCount
+            summary.werSum += w.rate
+            summary.werDistSum += w.dist
+            summary.werRefSum += w.refCount
             summary.exactSum += exact
-            summary.perFile.append(["filename": r.filename, "cer": c, "wer": w, "exact": exact == 1.0])
+            summary.perFile.append(["filename": r.filename, "cer": c.rate, "wer": w.rate, "exact": exact == 1.0])
         }
         return summary
     }
 
     private static func accuracyJSON(_ a: AccuracySummary) -> [String: Any] {
         guard a.compared > 0 else {
-            return ["compared": 0, "cer": 0, "wer": 0, "exact_match": 0, "per_file": []]
+            return ["compared": 0, "cer_macro": 0, "cer_micro": 0, "wer_macro": 0, "wer_micro": 0, "exact_match": 0, "per_file": []]
         }
         return [
             "compared": a.compared,
-            "cer": a.cerSum / Double(a.compared),
-            "wer": a.werSum / Double(a.compared),
+            "cer_macro": a.cerSum / Double(a.compared),
+            "cer_micro": a.cerRefSum > 0 ? Double(a.cerDistSum) / Double(a.cerRefSum) : 0,
+            "wer_macro": a.werSum / Double(a.compared),
+            "wer_micro": a.werRefSum > 0 ? Double(a.werDistSum) / Double(a.werRefSum) : 0,
             "exact_match": a.exactSum / Double(a.compared),
             "per_file": a.perFile,
         ]
@@ -493,18 +583,20 @@ struct OCRBenchmark {
         return prev[b.count]
     }
 
-    private static func cer(reference: String, predicted: String) -> Double {
+    private static func cerDetail(reference: String, predicted: String) -> (rate: Double, dist: Int, refCount: Int) {
         let r = Array(normalize(reference))
         let p = Array(normalize(predicted))
-        guard !r.isEmpty else { return p.isEmpty ? 0 : 1 }
-        return Double(levenshtein(r, p)) / Double(r.count)
+        guard !r.isEmpty else { return (p.isEmpty ? 0 : 1, p.count, 0) }
+        let dist = levenshtein(r, p)
+        return (Double(dist) / Double(r.count), dist, r.count)
     }
 
-    private static func wer(reference: String, predicted: String) -> Double {
+    private static func werDetail(reference: String, predicted: String) -> (rate: Double, dist: Int, refCount: Int) {
         let r = normalize(reference).split(separator: " ").map(String.init)
         let p = normalize(predicted).split(separator: " ").map(String.init)
-        guard !r.isEmpty else { return p.isEmpty ? 0 : 1 }
-        return Double(levenshtein(r, p)) / Double(r.count)
+        guard !r.isEmpty else { return (p.isEmpty ? 0 : 1, p.count, 0) }
+        let dist = levenshtein(r, p)
+        return (Double(dist) / Double(r.count), dist, r.count)
     }
 
     // MARK: - Environment / config metadata
@@ -533,9 +625,21 @@ struct OCRBenchmark {
             "recognition_languages": languages,
             "language_correction": true,
             "automatically_detects_language": autoLang,
-            "concurrency": concurrency,
+            "concurrency": concurrencyInfo(requested: concurrency),
             "force_legacy_engine": legacyEngine,
             "vision_revision": OCRService.visionRevisionLabel(),
+        ]
+    }
+
+    /// Report requested vs effective concurrency so published sweep graphs are
+    /// unambiguous about how many requests actually ran concurrently.
+    private static func concurrencyInfo(requested: Int) -> [String: Any] {
+        let effective = OCRService.clampedConcurrency(requested)
+        return [
+            "requested_concurrency": requested,
+            "effective_concurrency": effective,
+            "safety_ceiling": 16,
+            "benchmark_mode": true,
         ]
     }
 
@@ -573,8 +677,12 @@ struct OCRBenchmark {
         print(String(format: "   p95 latency:       %.0f ms", p95 * 1000))
         print(String(format: "   p99 latency:       %.0f ms", p99 * 1000))
         if let accuracy, accuracy.compared > 0 {
-            print(String(format: "   CER (chars):       %.3f%%", accuracy.cerSum / Double(accuracy.compared) * 100))
-            print(String(format: "   WER (words):       %.3f%%", accuracy.werSum / Double(accuracy.compared) * 100))
+            let cerMicro = accuracy.cerRefSum > 0 ? Double(accuracy.cerDistSum) / Double(accuracy.cerRefSum) * 100 : 0
+            let werMicro = accuracy.werRefSum > 0 ? Double(accuracy.werDistSum) / Double(accuracy.werRefSum) * 100 : 0
+            print(String(format: "   CER macro (chars): %.3f%%", accuracy.cerSum / Double(accuracy.compared) * 100))
+            print(String(format: "   CER micro (chars): %.3f%%", cerMicro))
+            print(String(format: "   WER macro (words): %.3f%%", accuracy.werSum / Double(accuracy.compared) * 100))
+            print(String(format: "   WER micro (words): %.3f%%", werMicro))
             print(String(format: "   Exact match:       %.1f%% (%d references)", accuracy.exactSum / Double(accuracy.compared) * 100, accuracy.compared))
         }
     }
@@ -694,6 +802,8 @@ struct OCRBenchmark {
                 o.sweep = true
             case "--adaptive":
                 o.adaptive = true
+            case "--adaptive-sweep":
+                o.adaptiveSweep = true
             case "--adaptive-threshold":
                 guard i + 1 < args.count, let t = Double(args[i + 1]), t >= 0, t <= 1 else {
                     print("❌ --adaptive-threshold requires a value between 0 and 1.")
@@ -740,6 +850,7 @@ struct OCRBenchmark {
           --sweep             Sweep concurrency over 1,2,3,4,5,6,8 and print a table
           --adaptive          Fast probe → retry accurate on low-confidence items; compares vs always-accurate
           --adaptive-threshold T  Retry when mean confidence < T (default 0.75; range 0-1)
+          --adaptive-sweep    Sweep the adaptive threshold (0.50-0.95) to find the accuracy/latency frontier
           --auto-lang         Enable automatic language detection per image
           --lang LIST         Comma-separated recognition languages, e.g. ms-MY,en-US (priority order)
           --legacy-engine     Force the legacy RecognizeTextRequest engine even on macOS 26
@@ -754,6 +865,7 @@ struct OCRBenchmark {
           --sequential        Accurate + sequential (baseline)
           --concurrency 8     Accurate + parallel with 8 concurrent requests
           --adaptive          Fast + retry-accurate cascade (benchmarked vs always-accurate)
+          --adaptive-sweep    Adaptive cascade across thresholds
           --resize-sweep      Accuracy/latency vs input resolution
 
         Accuracy:
@@ -769,6 +881,7 @@ struct OCRBenchmark {
           swift run OCRBenchmark ~/Screenshots --sweep --json sweep.json
           swift run OCRBenchmark ~/Screenshots --adaptive --json adaptive.json
           swift run OCRBenchmark ~/Screenshots --adaptive --adaptive-threshold 0.8
+          swift run OCRBenchmark ~/Screenshots --adaptive-sweep --references ~/gt --json adapt_sweep.json
           swift run OCRBenchmark ~/Screenshots --resize-sweep --references ~/gt --json resize.json
           swift run OCRBenchmark ~/Screenshots --lang ms-MY,en-US --json results.json
           swift run OCRBenchmark ~/Screenshots --legacy-engine --json results.json

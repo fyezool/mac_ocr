@@ -370,7 +370,11 @@ final class ServerManager: NSObject, @unchecked Sendable {
                     if let r = item.filename.range(of: " (page ") { base = String(item.filename[..<r.lowerBound]) }
                     else { base = item.filename }
                     guard let p = pathByKey[base] else { continue }
-                    if item.text.isEmpty || (item.confidence ?? 0) < threshold { retryPaths.append(p) }
+                    let blockMin = item.blocks.map(\.confidence).min() ?? 1
+                    let lowRatio = item.blocks.isEmpty ? 0 : Double(item.blocks.filter { $0.confidence < 0.5 }.count) / Double(item.blocks.count)
+                    if item.text.isEmpty || (item.confidence ?? 0) < threshold || blockMin < 0.4 || lowRatio > 0.25 {
+                        retryPaths.append(p)
+                    }
                 }
                 let accurateItems = retryPaths.isEmpty ? [] : await OCRService.recognizeTextStructured(paths: retryPaths, config: config)
                 var accurateByFilename: [String: OCRStructuredItem] = [:]
@@ -406,7 +410,15 @@ final class ServerManager: NSObject, @unchecked Sendable {
             log("POST", "/ocr", ip, "\(mapped.count) files", el, 200)
             return
         }
-        let resp = StructuredBatchResponse(results: mapped, server_duration_seconds: el, strategy: agent.mode ?? "accurate", engine: "vision")
+        let resp = StructuredBatchResponse(
+            results: mapped,
+            server_duration_seconds: el,
+            processing_ms: el * 1000,
+            strategy: agent.mode ?? "accurate",
+            engine: "vision",
+            engine_revision: OCRService.visionRevisionLabel(),
+            language: agent.languages?.first ?? "en-US"
+        )
         let json = ((try? JSONEncoder().encode(resp)).flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
         sendAndClose(fd, 200, json, "application/json")
         log("POST", "/ocr", ip, "\(mapped.count) files", el, 200)
@@ -553,8 +565,11 @@ private struct AgentOptions: Codable {
 private struct StructuredBatchResponse: Codable {
     let results: [OCRStructuredItem]
     let server_duration_seconds: Double
+    let processing_ms: Double
     let strategy: String
     let engine: String
+    let engine_revision: String
+    let language: String
 }
 
 private struct Req {

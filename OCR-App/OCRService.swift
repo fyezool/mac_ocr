@@ -61,9 +61,9 @@ struct OCRConfiguration {
     /// When false, uses `recognitionLanguages` exclusively (faster, more consistent).
     var automaticallyDetectsLanguage = false
 
-    /// Region-aware enhancement: small-text (or empty low-confidence) blocks are
-    /// cropped from the image, upscaled, and re-recognized before results are
-    /// assembled. Raises the accuracy ceiling for dense/degraded documents.
+    /// Region-aware enhancement: small-text blocks are cropped/upscaled/re-OCR'd,
+    /// and uncovered text-like regions are recovered from the source image.
+    /// Raises the accuracy ceiling for dense/degraded documents.
     var enhanceSmallText = false
 
     /// Normalized text height below which a block is treated as "small" and
@@ -80,11 +80,11 @@ struct OCRConfiguration {
 
 enum OCRService {
 
-    /// Defensive ceiling for concurrent Vision requests (ANE "SRAM performance
-    /// cliff" defense). The ANE evaluation queue accepts up to 127 requests but
-    /// has only 16 physical cores and a 32MB on-chip SRAM budget; more than ~4
-    /// concurrent high-resolution requests risks DRAM spill (~30% throughput
-    /// drop) and Jetsam termination under memory pressure.
+    /// Defensive ceiling for concurrent Vision requests. Beyond this we have
+    /// empirically observed a working-set performance cliff (throughput drops
+    /// and Jetsam risk under memory pressure), but the exact internal ANE SRAM
+    /// allocation is not exposed by the public API — treat this as a measured
+    /// safety limit for this workload/device, not a hardware guarantee.
     private static let concurrencyCeiling = 4
 
     /// Stability limit for single-file memory ingestion (MAX_FILE_SIZE_INGEST).
@@ -481,8 +481,7 @@ enum OCRService {
     /// source image, upscale it, and re-recognize. Replaces the block when the
     /// enhanced result is better (non-empty and higher confidence).
     private static func enhanceSmallText(blocks: [OCRBlock], in data: Data, config: OCRConfiguration) async -> [OCRBlock] {
-        guard !blocks.isEmpty,
-              let source = CGImageSourceCreateWithData(data as CFData, nil),
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
         else { return blocks }
 
@@ -493,14 +492,13 @@ enum OCRService {
         var baseConfig = config
         baseConfig.enhanceSmallText = false   // avoid recursion on crops
 
+        // 1) Re-OCR small-text blocks (crop → upscale → recognize).
         var result: [OCRBlock] = []
         for block in blocks {
             guard block.rect.count == 4 else { result.append(block); continue }
 
             let normH = CGFloat(block.rect[3])
-            let isSmall = normH < CGFloat(config.minBlockTextHeight)
-            let isEmpty = block.text.isEmpty && block.confidence < 0.6
-            guard isSmall || isEmpty else { result.append(block); continue }
+            guard normH < CGFloat(config.minBlockTextHeight) else { result.append(block); continue }
 
             // Vision boundingBox origin is bottom-left; CGImage is top-left.
             let x = CGFloat(block.rect[0]) * imageW
@@ -515,39 +513,109 @@ enum OCRService {
                   let crop = image.cropping(to: cropRect)
             else { result.append(block); continue }
 
-            // Upscale, clamped so the longest side never exceeds 4096px.
-            let scale = min(config.enhanceUpscaleFactor, CGFloat(4096) / CGFloat(max(crop.width, crop.height, 1)))
-            let targetW = max(Int(CGFloat(crop.width) * scale), 1)
-            let targetH = max(Int(CGFloat(crop.height) * scale), 1)
-            guard let ctx = CGContext(
-                data: nil, width: targetW, height: targetH,
-                bitsPerComponent: 8, bytesPerRow: 0,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-            ) else { result.append(block); continue }
-            ctx.interpolationQuality = CGInterpolationQuality.high
-            ctx.draw(crop, in: CGRect(origin: .zero, size: CGSize(width: targetW, height: targetH)))
-            guard let scaled = ctx.makeImage(),
-                  let png = NSBitmapImageRep(cgImage: scaled).representation(using: .png, properties: [:])
-            else { result.append(block); continue }
+            guard let png = upscalePNG(crop, factor: config.enhanceUpscaleFactor) else { result.append(block); continue }
 
-            let enhanced: (text: String, confidence: Double?)
             do {
                 let core = try await recognizeStructuredCore(in: png, config: baseConfig)
-                enhanced = (core.text, core.confidence)
+                if let newConfidence = core.confidence, newConfidence > block.confidence, !core.text.isEmpty {
+                    result.append(OCRBlock(text: core.text, confidence: newConfidence, rect: block.rect))
+                } else {
+                    result.append(block)
+                }
             } catch {
-                result.append(block)
-                continue
-            }
-            let newText = enhanced.text
-            let newConfidence = enhanced.confidence ?? 0
-            if !newText.isEmpty && (block.text.isEmpty || newConfidence > block.confidence) {
-                result.append(OCRBlock(text: newText, confidence: newConfidence, rect: block.rect))
-            } else {
                 result.append(block)
             }
         }
+
+        // 2) Recover missing text: grid cells with no detected blocks that look
+        //    text-like (mid-range dark-pixel ratio) are cropped, upscaled, and
+        //    OCR'd. This catches text Vision missed entirely on the first pass.
+        result.append(contentsOf: await recoverSuspiciousRegions(image: image, imageW: imageW, imageH: imageH, blocks: result, config: config, baseConfig: baseConfig))
         return result
+    }
+
+    /// Upscale a crop (clamped ≤4096px longest side) and return PNG data.
+    private static func upscalePNG(_ crop: CGImage, factor: CGFloat) -> Data? {
+        let scale = min(factor, CGFloat(4096) / CGFloat(max(crop.width, crop.height, 1)))
+        let targetW = max(Int(CGFloat(crop.width) * scale), 1)
+        let targetH = max(Int(CGFloat(crop.height) * scale), 1)
+        guard let ctx = CGContext(
+            data: nil, width: targetW, height: targetH,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = CGInterpolationQuality.high
+        ctx.draw(crop, in: CGRect(origin: .zero, size: CGSize(width: targetW, height: targetH)))
+        guard let scaled = ctx.makeImage() else { return nil }
+        return NSBitmapImageRep(cgImage: scaled).representation(using: .png, properties: [:])
+    }
+
+    /// Scan a grid of cells for text-like regions that no block covers, and
+    /// OCR them after cropping + upscaling. Returns recovered blocks in
+    /// global normalized coordinates.
+    private static func recoverSuspiciousRegions(image: CGImage, imageW: CGFloat, imageH: CGFloat, blocks: [OCRBlock], config: OCRConfiguration, baseConfig: OCRConfiguration) async -> [OCRBlock] {
+        let cellSize: CGFloat = 256
+        var recovered: [OCRBlock] = []
+        let cols = Int(ceil(imageW / cellSize))
+        let rows = Int(ceil(imageH / cellSize))
+
+        for row in 0..<rows {
+            for col in 0..<cols {
+                let cellRect = CGRect(x: CGFloat(col) * cellSize, y: CGFloat(row) * cellSize, width: cellSize, height: cellSize)
+                    .intersection(CGRect(x: 0, y: 0, width: imageW, height: imageH))
+                guard cellRect.width >= 64, cellRect.height >= 64 else { continue }
+                if blocks.contains(where: { blockRectIntersects($0.rect, cellRect, imageW: imageW, imageH: imageH) }) { continue }
+
+                let ratio = darkPixelRatio(image, in: cellRect)
+                guard ratio >= 0.03, ratio <= 0.6 else { continue }   // blank or solid-fill
+
+                let padded = cellRect.insetBy(dx: -16, dy: -16).intersection(CGRect(x: 0, y: 0, width: imageW, height: imageH))
+                guard let crop = image.cropping(to: padded),
+                      let png = upscalePNG(crop, factor: config.enhanceUpscaleFactor)
+                else { continue }
+
+                let core: (text: String, confidence: Double?, blocks: [OCRBlock])
+                do {
+                    core = try await recognizeStructuredCore(in: png, config: baseConfig)
+                } catch { continue }
+                guard !core.text.isEmpty, !core.blocks.isEmpty else { continue }
+
+                // Map crop-local normalized blocks (bottom-left origin) back to
+                // global normalized coordinates.
+                for local in core.blocks where local.rect.count == 4 {
+                    let nX = (padded.origin.x + CGFloat(local.rect[0]) * padded.width) / imageW
+                    let nY = (padded.origin.y + CGFloat(local.rect[1]) * padded.height) / imageH
+                    let nW = CGFloat(local.rect[2]) * padded.width / imageW
+                    let nH = CGFloat(local.rect[3]) * padded.height / imageH
+                    recovered.append(OCRBlock(text: local.text, confidence: local.confidence, rect: [Double(nX), Double(nY), Double(nW), Double(nH)]))
+                }
+            }
+        }
+        return recovered
+    }
+
+    private static func blockRectIntersects(_ rect: [Double], _ cell: CGRect, imageW: CGFloat, imageH: CGFloat) -> Bool {
+        guard rect.count == 4 else { return false }
+        let bx = CGFloat(rect[0]) * imageW
+        let by = (1 - CGFloat(rect[1]) - CGFloat(rect[3])) * imageH
+        let bw = CGFloat(rect[2]) * imageW
+        let bh = CGFloat(rect[3]) * imageH
+        return CGRect(x: bx, y: by, width: bw, height: bh).intersects(cell)
+    }
+
+    /// Fraction of pixels darker than mid-gray in a region (cheap text-ness
+    /// heuristic: blank ≈ 0, solid fill ≈ 1, text is in between).
+    private static func darkPixelRatio(_ image: CGImage, in rect: CGRect) -> Double {
+        guard let crop = image.cropping(to: rect) else { return 0 }
+        let w = crop.width, h = crop.height
+        guard w > 0, h > 0 else { return 0 }
+        var data = [UInt8](repeating: 0, count: w * h)
+        guard let ctx = CGContext(data: &data, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)
+        else { return 0 }
+        ctx.draw(crop, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let dark = data.lazy.filter { $0 < 128 }.count
+        return Double(dark) / Double(w * h)
     }
 
     private static func meanConfidence(_ blocks: [OCRBlock]) -> Double? {
@@ -672,4 +740,10 @@ enum OCRService {
     static let supportedImageExtensions: [String] = [
         "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "webp", "pdf"
     ]
+
+    /// Current Vision text-recognition request revision, exposed in the agent
+    /// API so clients can correlate results with the underlying engine version.
+    static func visionRevisionLabel() -> String {
+        String(describing: RecognizeTextRequest().revision)
+    }
 }

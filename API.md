@@ -219,7 +219,7 @@ Content-Type: multipart/form-data; boundary=<boundary>
 | `custom_words` | `[]` | Domain vocabulary to bias recognition |
 | `confidence_threshold` | `0.75` | Items below this mean confidence are retried in `adaptive` mode |
 | `structured` | `true` | `true` → blocks/confidence response; `false` → plain text |
-| `enhance_small_text` | `false` | Crop small-text blocks, upscale, and re-recognize them (region-aware ROI) |
+| `enhance_small_text` | `false` | Crop small-text blocks and re-OCR them; also recovers uncovered text-like regions from the image |
 
 ### Example
 
@@ -251,12 +251,17 @@ curl -X POST \
     }
   ],
   "server_duration_seconds": 0.42,
+  "processing_ms": 420,
   "strategy": "adaptive",
-  "engine": "vision"
+  "engine": "vision",
+  "engine_revision": "revision3",
+  "language": "ms-MY"
 }
 ```
 
-`strategy` reports the mode used. Without an `options` field, `POST /ocr`
+`strategy` reports the mode used. `engine_revision` records the Vision
+text-recognition request revision so results can be correlated with the
+underlying engine version. Without an `options` field, `POST /ocr`
 behaves exactly as documented above.
 
 ---
