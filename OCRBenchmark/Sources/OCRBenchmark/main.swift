@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import OCRCore
 
 // MARK: - Benchmark Runner
@@ -6,154 +7,545 @@ import OCRCore
 @main
 struct OCRBenchmark {
 
-    static func main() async {
-        let args = CommandLine.arguments
-
-        // Parse arguments
+    struct RunOptions {
+        var folder = ""
         var outputFormat = Format.table
-        var saveJsonPath: String?
+        var jsonPath: String?
+        var useFast = false
+        var useSequential = false
+        var useAutoLang = false
+        var concurrency: Int?
+        var sweep = false
+        var adaptive = false
+        var adaptiveThreshold = 0.75
+        var languages: [String]?
+        var legacyEngine = false
+        var resizeTo: Int?
+        var resizeSweep = false
+        var referencesDir: String?
+        var help = false
+    }
 
-        if args.contains("--help") || args.contains("-h") {
-            printUsage()
-            exit(0)
+    struct AccuracySummary {
+        var compared = 0
+        var cerSum = 0.0
+        var werSum = 0.0
+        var exactSum = 0.0
+        var perFile: [[String: Any]] = []
+    }
+
+    // MARK: - Entry
+
+    static func main() async {
+        let opts = parseOptions()
+        if opts.help { printUsage(); exit(0) }
+
+        if opts.sweep && opts.concurrency != nil {
+            print("❌ --sweep and --concurrency are mutually exclusive.")
+            exit(1)
         }
-
-        if let idx = args.firstIndex(of: "--json") {
-            outputFormat = .json
-            if idx + 1 < args.count, !args[idx + 1].hasPrefix("-") {
-                saveJsonPath = args[idx + 1]
-            }
+        if opts.useSequential && (opts.sweep || opts.concurrency != nil) {
+            print("❌ --sequential cannot be combined with --sweep/--concurrency.")
+            exit(1)
         }
-
-        let useFast = args.contains("--fast")
-        let useSequential = args.contains("--sequential")
-
-        if useFast && useSequential {
+        if opts.useFast && opts.useSequential {
             print("❌ Can't use --fast and --sequential together.")
             exit(1)
         }
-
-        let useAutoLang = args.contains("--auto-lang")
-
-        let modeLabel = useFast ? "fast + parallel" : (useSequential ? "accurate + sequential" : "accurate + parallel")
-
-        // Find first non-flag argument as folder path
-        let pathArg = args.dropFirst().first { !$0.hasPrefix("-") }
-        guard let folderPath = pathArg else {
-            printUsage()
+        if opts.adaptive && opts.useSequential {
+            print("❌ --adaptive cannot be combined with --sequential.")
             exit(1)
         }
+        if opts.adaptive && opts.sweep {
+            print("❌ --adaptive cannot be combined with --sweep.")
+            exit(1)
+        }
+        if opts.adaptive && opts.useFast {
+            print("❌ --adaptive cannot be combined with --fast (adaptive already uses fast as its cheap pass).")
+            exit(1)
+        }
+        if opts.resizeSweep && (opts.sweep || opts.adaptive || opts.useSequential) {
+            print("❌ --resize-sweep cannot be combined with --sweep/--adaptive/--sequential.")
+            exit(1)
+        }
+        if opts.resizeSweep && opts.resizeTo != nil {
+            print("❌ --resize-sweep and --resize-to are mutually exclusive.")
+            exit(1)
+        }
+        guard !opts.folder.isEmpty else { printUsage(); exit(1) }
 
-        // Collect images
-        let folderURL = URL(fileURLWithPath: (folderPath as NSString).expandingTildeInPath)
+        let folderURL = URL(fileURLWithPath: (opts.folder as NSString).expandingTildeInPath)
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDir), isDir.boolValue else {
-            print("❌ Error: '\(folderPath)' is not a valid directory.")
+            print("❌ Error: '\(opts.folder)' is not a valid directory.")
             exit(1)
         }
 
         print("📁 Scanning \"\(folderURL.path)\" for images…", terminator: " ")
         let images = OCRService.collectImages(from: folderURL)
         print("found \(images.count) image(s).")
+        guard !images.isEmpty else { print("No images found. Exiting."); exit(0) }
 
-        guard !images.isEmpty else {
-            print("No images found. Exiting.")
-            exit(0)
+        let levelLabel = opts.useFast ? "fast" : "accurate"
+        if opts.resizeSweep {
+            await runResizeSweep(images: images, options: opts)
+        } else if opts.adaptive {
+            await runAdaptive(images: images, options: opts)
+        } else if opts.sweep {
+            await runSweep(images: images, options: opts, levelLabel: levelLabel)
+        } else {
+            await runSingle(images: images, options: opts, levelLabel: levelLabel)
         }
+    }
 
-        // Run OCR
+    // MARK: - Shared config / path helpers
+
+    private static func applyCommonConfig(_ config: inout OCRConfiguration, options: RunOptions) {
+        config.maxConcurrency = options.concurrency ?? config.maxConcurrency
+        config.automaticallyDetectsLanguage = options.useAutoLang
+        config.customWords = ["OCR", "Apple", "Vision", "Neural Engine"]
+        config.forceLegacyEngine = options.legacyEngine
+        if let languages = options.languages, !languages.isEmpty {
+            config.recognitionLanguages = languages.map { Locale.Language(identifier: $0) }
+        }
+    }
+
+    /// Returns OCR paths for the given images, optionally downscaling to
+    /// `maxPixelSide` (0/absent = native). Resized files keep the original
+    /// basename so `--references` still matches. Caller must run `cleanup()`.
+    private static func preparePaths(images: [URL], maxPixelSide: Int?) -> (paths: [String], cleanup: () -> Void) {
+        guard let maxPixelSide else { return (images.map(\.path), {}) }
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("ocr_resize_\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        var paths: [String] = []
+        for img in images {
+            if img.pathExtension.lowercased() == "pdf" {
+                paths.append(img.path)
+                continue
+            }
+            guard let data = OCRService.resizedImageData(at: img, maxPixelSide: maxPixelSide) else { continue }
+            let name = (img.lastPathComponent as NSString).deletingPathExtension + ".png"
+            let out = tmpDir.appendingPathComponent(name)
+            if (try? data.write(to: out)) != nil { paths.append(out.path) }
+        }
+        return (paths, { try? FileManager.default.removeItem(at: tmpDir) })
+    }
+
+    // MARK: - Single run
+
+    private static func runSingle(images: [URL], options: RunOptions, levelLabel: String) async {
+        let concurrency = options.concurrency ?? (options.useSequential ? 1 : 4)
+        let modeLabel = options.useFast ? "fast + parallel" : (options.useSequential ? "accurate + sequential" : "accurate + parallel (\(concurrency))")
         print("🔍 Running OCR on \(images.count) image(s) (\(modeLabel))…")
         print(String(repeating: "─", count: 60))
 
+        let (paths, cleanup) = preparePaths(images: images, maxPixelSide: options.resizeTo)
+        defer { cleanup() }
+
         let startTotal = CFAbsoluteTimeGetCurrent()
-        let paths = images.map(\.path)
         let results: [OCRItem]
-        if useSequential {
-            results = await OCRService.recognizeTextSequential(paths: paths, fast: useFast)
+        if options.useSequential {
+            results = await OCRService.recognizeTextSequential(paths: paths, fast: options.useFast)
         } else {
             var config = OCRConfiguration.default
-            if useFast { config.recognitionLevel = .fast }
-            config.automaticallyDetectsLanguage = useAutoLang
-            config.customWords = ["OCR", "Apple", "Vision", "Neural Engine"]
+            if options.useFast { config.recognitionLevel = .fast }
+            applyCommonConfig(&config, options: options)
             results = await OCRService.recognizeText(paths: paths, config: config)
         }
         let totalElapsed = CFAbsoluteTimeGetCurrent() - startTotal
 
-        // Compute stats
-        let successful = results.filter { $0.error == nil && !$0.text.isEmpty }
-        let failed = results.filter { $0.error != nil }
-        let empty = results.filter { $0.error == nil && $0.text.isEmpty }
-
+        let successful = results.filter { $0.error == nil && !$0.text.isEmpty }.count
+        let failed = results.filter { $0.error != nil }.count
+        let empty = results.filter { $0.error == nil && $0.text.isEmpty }.count
         let totalDuration = results.reduce(0.0) { $0 + $1.duration }
-        let avgDuration = totalDuration / Double(results.count)
-        let imagesPerSecond: Double = totalElapsed > 0 ? Double(results.count) / totalElapsed : 0
+        let avgDuration = totalDuration / Double(max(results.count, 1))
+        let imagesPerSecond = totalElapsed > 0 ? Double(results.count) / totalElapsed : 0
+        let (p50, p95, p99) = percentiles(results.map(\.duration))
+        let accuracy = options.referencesDir.map { computeAccuracy(results: results, referencesDir: $0) }
 
-        // ---- Output ----
-        switch outputFormat {
+        switch options.outputFormat {
         case .table:
-            printTable(results: results, totalElapsed: totalElapsed, totalDuration: totalDuration,
-                       avgDuration: avgDuration, imagesPerSecond: imagesPerSecond,
-                       successful: successful.count, failed: failed.count, empty: empty.count)
+            printSingleTable(results: results, totalElapsed: totalElapsed, totalDuration: totalDuration,
+                             avgDuration: avgDuration, imagesPerSecond: imagesPerSecond,
+                             successful: successful, failed: failed, empty: empty,
+                             p50: p50, p95: p95, p99: p99, accuracy: accuracy, concurrency: concurrency)
         case .json:
-            let jsonOutput = buildJSON(results: results, totalElapsed: totalElapsed, totalDuration: totalDuration,
-                                       avgDuration: avgDuration, imagesPerSecond: imagesPerSecond,
-                                       totalImages: images.count, successful: successful.count,
-                                       failed: failed.count, empty: empty.count)
-            if let path = saveJsonPath {
-                do {
-                    try jsonOutput.write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
-                    print("📄 JSON results saved to: \(path)")
-                } catch {
-                    print("❌ Failed to write JSON: \(error.localizedDescription)")
-                    print(jsonOutput)
-                }
-            } else {
-                print(jsonOutput)
-            }
+            let json = buildSingleJSON(results: results, options: options, levelLabel: levelLabel, concurrency: concurrency,
+                                       totalElapsed: totalElapsed, totalDuration: totalDuration, avgDuration: avgDuration,
+                                       imagesPerSecond: imagesPerSecond, totalImages: images.count,
+                                       successful: successful, failed: failed, empty: empty,
+                                       p50: p50, p95: p95, p99: p99, accuracy: accuracy)
+            emitJSON(json, path: options.jsonPath)
         }
     }
 
-    // MARK: - Helpers
+    // MARK: - Concurrency sweep
 
-    private static func printUsage() {
-        print("""
-        OCR Benchmark — measure Apple Vision text recognition performance
+    private static func runSweep(images: [URL], options: RunOptions, levelLabel: String) async {
+        let levels = [1, 2, 3, 4, 5, 6, 8]
+        print("🔍 Sweeping concurrency (\(levelLabel)) over [\(levels.map(String.init).joined(separator: ", "))]…")
+        print(String(repeating: "─", count: 60))
+        print(pad("Concurrency", 13) + pad("Wall(s)", 12) + pad("img/s", 9) + pad("p50(ms)", 11) + pad("p95(ms)", 11) + "p99(ms)")
+        print(String(repeating: "─", count: 60))
 
-        Usage:
-          swift run OCRBenchmark <folder-path> [options]
+        var runs: [[String: Any]] = []
+        for level in levels {
+            var config = OCRConfiguration.default
+            if options.useFast { config.recognitionLevel = .fast }
+            applyCommonConfig(&config, options: options)
+            config.maxConcurrency = level
 
-        Options:
-          --json [path]    Output in JSON format (optionally save to file)
-          --fast           Use .fast recognition level (parallel, 2-3x faster, may miss text)
-          --sequential     Process images one at a time (no parallelism, useful for baseline comparison)
-          --auto-lang      Enable automatic language detection per image (slower, useful for mixed languages)
-          --help, -h       Show this help
+            let start = CFAbsoluteTimeGetCurrent()
+            let results = await OCRService.recognizeText(paths: images.map(\.path), config: config)
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
 
-        Modes (default: accurate + parallel):
-          (no flags)       Accurate + parallel (~3× faster than sequential)
-          --fast           Fast + parallel (~6× faster than accurate, may miss text)
-          --sequential     Accurate + sequential (baseline, matches original behavior)
+            let successful = results.filter { $0.error == nil && !$0.text.isEmpty }.count
+            let failed = results.filter { $0.error != nil }.count
+            let empty = results.filter { $0.error == nil && $0.text.isEmpty }.count
+            let throughput = elapsed > 0 ? Double(results.count) / elapsed : 0
+            let (p50, p95, p99) = percentiles(results.map(\.duration))
+            let accuracy = options.referencesDir.map { computeAccuracy(results: results, referencesDir: $0) }
 
-        Examples:
-          swift run OCRBenchmark ~/Screenshots
-          swift run OCRBenchmark ~/Screenshots --fast
-          swift run OCRBenchmark ~/Screenshots --sequential
-          swift run OCRBenchmark ~/Screenshots --json results.json
-          swift run OCRBenchmark ~/Screenshots --auto-lang --json results.json
-        """)
+            print(pad(String(level), 13) + pad(String(format: "%.2f", elapsed), 12) + pad(String(format: "%.1f", throughput), 9)
+                + pad(String(format: "%.0f", p50 * 1000), 11) + pad(String(format: "%.0f", p95 * 1000), 11) + String(format: "%.0f", p99 * 1000))
+
+            var run: [String: Any] = [
+                "concurrency": level,
+                "wall_clock_seconds": elapsed,
+                "throughput_img_s": throughput,
+                "p50_latency_ms": p50 * 1000,
+                "p95_latency_ms": p95 * 1000,
+                "p99_latency_ms": p99 * 1000,
+                "successful": successful,
+                "failed": failed,
+                "empty": empty,
+            ]
+            if let accuracy { run["accuracy"] = accuracyJSON(accuracy) }
+            runs.append(run)
+        }
+
+        if options.outputFormat == .json {
+            let output: [String: Any] = [
+                "schema_version": "1.0",
+                "mode": "sweep",
+                "environment": environmentInfo(),
+                "ocr": ocrInfo(level: levelLabel, concurrency: 0, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
+                "concurrency_levels": levels,
+                "runs": runs,
+            ]
+            emitJSON(output, path: options.jsonPath)
+        }
     }
 
-    private static func printTable(
-        results: [OCRItem],
-        totalElapsed: TimeInterval,
-        totalDuration: TimeInterval,
-        avgDuration: TimeInterval,
-        imagesPerSecond: Double,
-        successful: Int,
-        failed: Int,
-        empty: Int
+    // MARK: - Adaptive cascade
+
+    /// fast probe → retry accurate on low-confidence/empty items, compared
+    /// against an always-accurate baseline on mean throughput, p95, and accuracy.
+    private static func runAdaptive(images: [URL], options: RunOptions) async {
+        let paths = images.map(\.path)
+        let concurrency = options.concurrency ?? 4
+        let threshold = options.adaptiveThreshold
+        print("🔍 Adaptive OCR (fast probe → retry accurate when confidence < \(threshold)) on \(images.count) image(s)…")
+        print(String(repeating: "─", count: 60))
+
+        var fastConfig = OCRConfiguration.default
+        fastConfig.recognitionLevel = .fast
+        applyCommonConfig(&fastConfig, options: options)
+        fastConfig.maxConcurrency = concurrency
+
+        var accurateConfig = OCRConfiguration.default
+        applyCommonConfig(&accurateConfig, options: options)
+        accurateConfig.maxConcurrency = concurrency
+
+        // Pass 1: fast probe with per-item mean confidence
+        let totalStart = CFAbsoluteTimeGetCurrent()
+        let fastItems = await OCRService.recognizeTextDetailed(paths: paths, config: fastConfig)
+
+        // Decide which whole files need an accurate retry (any item below threshold)
+        let pathByKey = Dictionary(images.map { (ownerKey($0.lastPathComponent), $0.path) }, uniquingKeysWith: { a, _ in a })
+        var retryPaths = Set<String>()
+        for item in fastItems {
+            guard let path = pathByKey[ownerKey(item.filename)] else { continue }
+            if item.text.isEmpty || (item.meanConfidence ?? 0) < threshold {
+                retryPaths.insert(path)
+            }
+        }
+        let retryList = paths.filter { retryPaths.contains($0) }
+
+        // Pass 2: accurate retry on the retry set
+        var accurateByFilename: [String: OCRItem] = [:]
+        if !retryList.isEmpty {
+            let retryStart = CFAbsoluteTimeGetCurrent()
+            let retryResults = await OCRService.recognizeText(paths: retryList, config: accurateConfig)
+            let retryElapsed = CFAbsoluteTimeGetCurrent() - retryStart
+            print(String(format: "   Fast pass: %8.2fs   retry (accurate): %6.2fs   retried %d/%d files", CFAbsoluteTimeGetCurrent() - totalStart - retryElapsed, retryElapsed, retryPaths.count, images.count))
+            for r in retryResults { accurateByFilename[r.filename] = r }
+        } else {
+            print(String(format: "   Fast pass: %8.2fs   no retries needed", CFAbsoluteTimeGetCurrent() - totalStart))
+        }
+
+        // Build final per-item results (accurate text replaces fast for retried items)
+        var finalItems: [OCRItem] = []
+        for item in fastItems {
+            if let accurate = accurateByFilename[item.filename] {
+                finalItems.append(accurate)
+            } else {
+                finalItems.append(OCRItem(filename: item.filename, text: item.text, error: item.error, duration: item.duration))
+            }
+        }
+        let wall = CFAbsoluteTimeGetCurrent() - totalStart
+
+        // Baseline: always-accurate
+        let baseStart = CFAbsoluteTimeGetCurrent()
+        let baseItems = await OCRService.recognizeText(paths: paths, config: accurateConfig)
+        let baseWall = CFAbsoluteTimeGetCurrent() - baseStart
+
+        let adaptiveStats = runStats(finalItems, wall: wall)
+        let baselineStats = runStats(baseItems, wall: baseWall)
+        let accuracyAdaptive = options.referencesDir.map { computeAccuracy(results: finalItems, referencesDir: $0) }
+        let accuracyBaseline = options.referencesDir.map { computeAccuracy(results: baseItems, referencesDir: $0) }
+
+        if options.outputFormat == .table {
+            print(String(repeating: "─", count: 60))
+            print("📊 Adaptive vs baseline:")
+            print("   " + pad("", 16) + pad("Adaptive", 18) + "Baseline")
+            print("   " + pad("Wall (s)", 16) + pad(String(format: "%.2f", wall), 18) + String(format: "%.2f", baseWall))
+            print("   " + pad("Items/s", 16) + pad(String(format: "%.2f", adaptiveStats["throughput_items_s"] as? Double ?? 0), 18) + String(format: "%.2f", baselineStats["throughput_items_s"] as? Double ?? 0))
+            print("   " + pad("p50 (ms)", 16) + pad(String(format: "%.0f", adaptiveStats["p50_latency_ms"] as? Double ?? 0), 18) + String(format: "%.0f", baselineStats["p50_latency_ms"] as? Double ?? 0))
+            print("   " + pad("p95 (ms)", 16) + pad(String(format: "%.0f", adaptiveStats["p95_latency_ms"] as? Double ?? 0), 18) + String(format: "%.0f", baselineStats["p95_latency_ms"] as? Double ?? 0))
+            if let a = accuracyAdaptive, let b = accuracyBaseline, a.compared > 0, b.compared > 0 {
+                print("   " + pad("CER (%)", 16) + pad(String(format: "%.2f", a.cerSum / Double(a.compared) * 100), 18) + String(format: "%.2f", b.cerSum / Double(b.compared) * 100))
+                print("   " + pad("WER (%)", 16) + pad(String(format: "%.2f", a.werSum / Double(a.compared) * 100), 18) + String(format: "%.2f", b.werSum / Double(b.compared) * 100))
+            }
+            let speedup = wall > 0 ? baseWall / wall : 0
+            let verdict = speedup >= 1 ? "adaptive wins" : "baseline wins"
+            print("   Wall speedup: \(String(format: "%.2f", speedup))× → \(verdict)")
+        } else {
+            var adaptive = adaptiveStats
+            if let accuracyAdaptive { adaptive["accuracy"] = accuracyJSON(accuracyAdaptive) }
+            var baseline = baselineStats
+            if let accuracyBaseline { baseline["accuracy"] = accuracyJSON(accuracyBaseline) }
+            let output: [String: Any] = [
+                "schema_version": "1.0",
+                "mode": "adaptive",
+                "environment": environmentInfo(),
+                "ocr": [
+                    "recognition_level": "fast+accurate",
+                    "recognition_languages": options.languages ?? ["en-US"],
+                    "concurrency": concurrency,
+                    "adaptive_threshold": threshold,
+                    "force_legacy_engine": options.legacyEngine,
+                    "vision_revision": OCRService.visionRevisionLabel(),
+                ],
+                "retried_files": retryPaths.count,
+                "total_files": images.count,
+                "adaptive": adaptive,
+                "baseline_accurate": baseline,
+                "speedup_wall_x": wall > 0 ? baseWall / wall : 0,
+            ]
+            emitJSON(output, path: options.jsonPath)
+        }
+    }
+
+    private static func ownerKey(_ filename: String) -> String {
+        if let range = filename.range(of: " (page ") {
+            return String(filename[..<range.lowerBound])
+        }
+        return filename
+    }
+
+    private static func runStats(_ items: [OCRItem], wall: TimeInterval) -> [String: Any] {
+        let successful = items.filter { $0.error == nil && !$0.text.isEmpty }.count
+        let failed = items.filter { $0.error != nil }.count
+        let empty = items.filter { $0.error == nil && $0.text.isEmpty }.count
+        let (p50, p95, p99) = percentiles(items.map(\.duration))
+        let throughput = wall > 0 ? Double(items.count) / wall : 0
+        return [
+            "items": items.count,
+            "successful": successful,
+            "failed": failed,
+            "empty": empty,
+            "wall_clock_seconds": wall,
+            "throughput_items_s": throughput,
+            "p50_latency_ms": p50 * 1000,
+            "p95_latency_ms": p95 * 1000,
+            "p99_latency_ms": p99 * 1000,
+        ]
+    }
+
+    // MARK: - Resolution sweep
+
+    private static func runResizeSweep(images: [URL], options: RunOptions) async {
+        let sizes = [512, 1024, 1536, 2048, 3072, 4096, 0]   // 0 = native
+        print("🔍 Resolution sweep (accurate) over [\(sizes.map { $0 == 0 ? "native" : String($0) }.joined(separator: ", "))]…")
+        print(String(repeating: "─", count: 60))
+        print(pad("MaxSide", 12) + pad("Wall(s)", 12) + pad("img/s", 9) + pad("p50(ms)", 11) + pad("p95(ms)", 11) + pad("CER(%)", 10) + "WER(%)")
+        print(String(repeating: "─", count: 60))
+
+        var runs: [[String: Any]] = []
+        for size in sizes {
+            var config = OCRConfiguration.default
+            applyCommonConfig(&config, options: options)
+
+            let start = CFAbsoluteTimeGetCurrent()
+            let (paths, cleanup) = preparePaths(images: images, maxPixelSide: size == 0 ? nil : size)
+            let results = await OCRService.recognizeText(paths: paths, config: config)
+            let wall = CFAbsoluteTimeGetCurrent() - start
+            cleanup()
+
+            let (p50, p95, _) = percentiles(results.map(\.duration))
+            let throughput = wall > 0 ? Double(results.count) / wall : 0
+            let accuracy = options.referencesDir.map { computeAccuracy(results: results, referencesDir: $0) }
+            let cerPct = accuracy.map { $0.compared > 0 ? $0.cerSum / Double($0.compared) * 100 : 0 } ?? 0
+            let werPct = accuracy.map { $0.compared > 0 ? $0.werSum / Double($0.compared) * 100 : 0 } ?? 0
+
+            let label = size == 0 ? "native" : String(size)
+            print(pad(label, 12) + pad(String(format: "%.2f", wall), 12) + pad(String(format: "%.1f", throughput), 9)
+                + pad(String(format: "%.0f", p50 * 1000), 11) + pad(String(format: "%.0f", p95 * 1000), 11)
+                + pad(String(format: "%.2f", cerPct), 10) + String(format: "%.2f", werPct))
+
+            var run: [String: Any] = [
+                "max_pixel_side": size,
+                "wall_clock_seconds": wall,
+                "throughput_img_s": throughput,
+                "p50_latency_ms": p50 * 1000,
+                "p95_latency_ms": p95 * 1000,
+                "items": results.count,
+            ]
+            if let accuracy { run["accuracy"] = accuracyJSON(accuracy) }
+            runs.append(run)
+        }
+
+        if options.outputFormat == .json {
+            let output: [String: Any] = [
+                "schema_version": "1.0",
+                "mode": "resize_sweep",
+                "environment": environmentInfo(),
+                "ocr": ocrInfo(level: "accurate", concurrency: options.concurrency ?? 4, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
+                "sizes": sizes,
+                "runs": runs,
+            ]
+            emitJSON(output, path: options.jsonPath)
+        }
+    }
+
+    // MARK: - Accuracy (CER / WER)
+
+    private static func computeAccuracy(results: [OCRItem], referencesDir: String) -> AccuracySummary {
+        var summary = AccuracySummary()
+        for r in results {
+            let base = baseName(r.filename)
+            let refPath = (referencesDir as NSString).appendingPathComponent("\(base).txt")
+            guard let reference = try? String(contentsOfFile: refPath, encoding: .utf8) else { continue }
+
+            let c = cer(reference: reference, predicted: r.text)
+            let w = wer(reference: reference, predicted: r.text)
+            let exact = normalize(reference) == normalize(r.text) ? 1.0 : 0.0
+            summary.compared += 1
+            summary.cerSum += c
+            summary.werSum += w
+            summary.exactSum += exact
+            summary.perFile.append(["filename": r.filename, "cer": c, "wer": w, "exact": exact == 1.0])
+        }
+        return summary
+    }
+
+    private static func accuracyJSON(_ a: AccuracySummary) -> [String: Any] {
+        guard a.compared > 0 else {
+            return ["compared": 0, "cer": 0, "wer": 0, "exact_match": 0, "per_file": []]
+        }
+        return [
+            "compared": a.compared,
+            "cer": a.cerSum / Double(a.compared),
+            "wer": a.werSum / Double(a.compared),
+            "exact_match": a.exactSum / Double(a.compared),
+            "per_file": a.perFile,
+        ]
+    }
+
+    private static func baseName(_ filename: String) -> String {
+        if let range = filename.range(of: " (page ") {
+            return (String(filename[..<range.lowerBound]) as NSString).deletingPathExtension
+        }
+        return (filename as NSString).deletingPathExtension
+    }
+
+    private static func normalize(_ s: String) -> String {
+        s.lowercased()
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    private static func levenshtein<Element: Equatable>(_ a: [Element], _ b: [Element]) -> Int {
+        guard !a.isEmpty else { return b.count }
+        guard !b.isEmpty else { return a.count }
+        var prev = Array(0...b.count)
+        var curr = [Int](repeating: 0, count: b.count + 1)
+        for i in 1...a.count {
+            curr[0] = i
+            for j in 1...b.count {
+                let cost = a[i - 1] == b[j - 1] ? 0 : 1
+                curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+            }
+            swap(&prev, &curr)
+        }
+        return prev[b.count]
+    }
+
+    private static func cer(reference: String, predicted: String) -> Double {
+        let r = Array(normalize(reference))
+        let p = Array(normalize(predicted))
+        guard !r.isEmpty else { return p.isEmpty ? 0 : 1 }
+        return Double(levenshtein(r, p)) / Double(r.count)
+    }
+
+    private static func wer(reference: String, predicted: String) -> Double {
+        let r = normalize(reference).split(separator: " ").map(String.init)
+        let p = normalize(predicted).split(separator: " ").map(String.init)
+        guard !r.isEmpty else { return p.isEmpty ? 0 : 1 }
+        return Double(levenshtein(r, p)) / Double(r.count)
+    }
+
+    // MARK: - Environment / config metadata
+
+    private static func sysctlString(_ name: String) -> String? {
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else { return nil }
+        return buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+    }
+
+    private static func environmentInfo() -> [String: Any] {
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        return [
+            "os": "macOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)",
+            "device_model": sysctlString("hw.model") ?? "unknown",
+            "soc": sysctlString("machdep.cpu.brand_string") ?? "unknown",
+            "memory_gb": Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0,
+        ]
+    }
+
+    private static func ocrInfo(level: String, concurrency: Int, autoLang: Bool, languages: [String] = ["en-US"], legacyEngine: Bool = false) -> [String: Any] {
+        return [
+            "recognition_level": level,
+            "recognition_languages": languages,
+            "language_correction": true,
+            "automatically_detects_language": autoLang,
+            "concurrency": concurrency,
+            "force_legacy_engine": legacyEngine,
+            "vision_revision": OCRService.visionRevisionLabel(),
+        ]
+    }
+
+    // MARK: - Output
+
+    private static func printSingleTable(
+        results: [OCRItem], totalElapsed: TimeInterval, totalDuration: TimeInterval,
+        avgDuration: TimeInterval, imagesPerSecond: Double, successful: Int, failed: Int, empty: Int,
+        p50: Double, p95: Double, p99: Double, accuracy: AccuracySummary?, concurrency: Int
     ) {
-        // Per-file details
         let header = "Duration     File\(String(repeating: " ", count: 36))Chars  Error"
         print(header)
         print(String(repeating: "─", count: 75))
@@ -166,9 +558,9 @@ struct OCRBenchmark {
             print(line)
         }
 
-        // Summary
         print(String(repeating: "─", count: 60))
         print("📊 Summary:")
+        print("   Concurrency:        \(concurrency)")
         print("   Total images:       \(results.count)")
         print("   Successful OCR:     \(successful)")
         print("   Empty results:      \(empty)")
@@ -177,22 +569,22 @@ struct OCRBenchmark {
         print(String(format: "   Sum of durations:  %.3fs", totalDuration))
         print(String(format: "   Average per image: %.3fs", avgDuration))
         print(String(format: "   Throughput:        %.1f images/s", imagesPerSecond))
+        print(String(format: "   p50 latency:       %.0f ms", p50 * 1000))
+        print(String(format: "   p95 latency:       %.0f ms", p95 * 1000))
+        print(String(format: "   p99 latency:       %.0f ms", p99 * 1000))
+        if let accuracy, accuracy.compared > 0 {
+            print(String(format: "   CER (chars):       %.3f%%", accuracy.cerSum / Double(accuracy.compared) * 100))
+            print(String(format: "   WER (words):       %.3f%%", accuracy.werSum / Double(accuracy.compared) * 100))
+            print(String(format: "   Exact match:       %.1f%% (%d references)", accuracy.exactSum / Double(accuracy.compared) * 100, accuracy.compared))
+        }
     }
 
-    private static func buildJSON(
-        results: [OCRItem],
-        totalElapsed: TimeInterval,
-        totalDuration: TimeInterval,
-        avgDuration: TimeInterval,
-        imagesPerSecond: Double,
-        totalImages: Int,
-        successful: Int,
-        failed: Int,
-        empty: Int
-    ) -> String {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-
+    private static func buildSingleJSON(
+        results: [OCRItem], options: RunOptions, levelLabel: String, concurrency: Int,
+        totalElapsed: TimeInterval, totalDuration: TimeInterval, avgDuration: TimeInterval,
+        imagesPerSecond: Double, totalImages: Int, successful: Int, failed: Int, empty: Int,
+        p50: Double, p95: Double, p99: Double, accuracy: AccuracySummary?
+    ) -> [String: Any] {
         let summary: [String: Any] = [
             "total_images": totalImages,
             "successful": successful,
@@ -202,9 +594,16 @@ struct OCRBenchmark {
             "sum_duration_seconds": totalDuration,
             "avg_duration_seconds": avgDuration,
             "images_per_second": imagesPerSecond,
+            "p50_latency_ms": p50 * 1000,
+            "p95_latency_ms": p95 * 1000,
+            "p99_latency_ms": p99 * 1000,
         ]
 
-        let output: [String: Any] = [
+        var output: [String: Any] = [
+            "schema_version": "1.0",
+            "mode": "single",
+            "environment": environmentInfo(),
+            "ocr": ocrInfo(level: levelLabel, concurrency: concurrency, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
             "summary": summary,
             "results": results.map { r in
                 [
@@ -215,13 +614,166 @@ struct OCRBenchmark {
                 ]
             },
         ]
+        if let accuracy { output["accuracy"] = accuracyJSON(accuracy) }
+        return output
+    }
 
-        guard let data = try? JSONSerialization.data(withJSONObject: output, options: [.prettyPrinted, .sortedKeys]),
-              let jsonString = String(data: data, encoding: .utf8)
+    private static func emitJSON(_ object: [String: Any], path: String?) {
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]),
+              let string = String(data: data, encoding: .utf8)
         else {
-            return "{}"
+            print("{}")
+            return
         }
-        return jsonString
+        if let path {
+            do {
+                try string.write(toFile: path, atomically: true, encoding: .utf8)
+                print("📄 JSON results saved to: \(path)")
+            } catch {
+                print("❌ Failed to write JSON: \(error.localizedDescription)")
+                print(string)
+            }
+        } else {
+            print(string)
+        }
+    }
+
+    private static func percentiles(_ durations: [Double]) -> (p50: Double, p95: Double, p99: Double) {
+        let sorted = durations.sorted()
+        func pct(_ p: Double) -> Double {
+            guard !sorted.isEmpty else { return 0 }
+            return sorted[Int((Double(sorted.count - 1) * p).rounded())]
+        }
+        return (pct(0.50), pct(0.95), pct(0.99))
+    }
+
+    private static func pad(_ s: String, _ width: Int) -> String {
+        s.count >= width ? s : s + String(repeating: " ", count: width - s.count)
+    }
+
+    // MARK: - Argument parsing
+
+    private static func parseOptions() -> RunOptions {
+        var o = RunOptions()
+        let args = CommandLine.arguments
+        if args.contains("--help") || args.contains("-h") { o.help = true; return o }
+
+        var i = 1
+        while i < args.count {
+            let a = args[i]
+            switch a {
+            case "--json":
+                o.outputFormat = .json
+                if i + 1 < args.count, !args[i + 1].hasPrefix("-") {
+                    o.jsonPath = args[i + 1]; i += 1
+                }
+            case "--fast":
+                o.useFast = true
+            case "--sequential":
+                o.useSequential = true
+            case "--auto-lang":
+                o.useAutoLang = true
+            case "--lang":
+                guard i + 1 < args.count, !args[i + 1].hasPrefix("-") else {
+                    print("❌ --lang requires a value (e.g. ms-MY,en-US).")
+                    exit(1)
+                }
+                o.languages = args[i + 1].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                i += 1
+            case "--legacy-engine":
+                o.legacyEngine = true
+            case "--resize-to":
+                guard i + 1 < args.count, let n = Int(args[i + 1]), n > 0 else {
+                    print("❌ --resize-to requires a positive pixel value.")
+                    exit(1)
+                }
+                o.resizeTo = n; i += 1
+            case "--resize-sweep":
+                o.resizeSweep = true
+            case "--sweep":
+                o.sweep = true
+            case "--adaptive":
+                o.adaptive = true
+            case "--adaptive-threshold":
+                guard i + 1 < args.count, let t = Double(args[i + 1]), t >= 0, t <= 1 else {
+                    print("❌ --adaptive-threshold requires a value between 0 and 1.")
+                    exit(1)
+                }
+                o.adaptiveThreshold = t; i += 1
+            case "--concurrency":
+                guard i + 1 < args.count, let n = Int(args[i + 1]), n >= 1 else {
+                    print("❌ --concurrency requires a positive integer value.")
+                    exit(1)
+                }
+                o.concurrency = n; i += 1
+            case "--references":
+                guard i + 1 < args.count, !args[i + 1].hasPrefix("-") else {
+                    print("❌ --references requires a directory path.")
+                    exit(1)
+                }
+                o.referencesDir = args[i + 1]; i += 1
+            default:
+                if a.hasPrefix("-") {
+                    print("Unknown option: \(a) (see --help)")
+                    exit(1)
+                }
+                if o.folder.isEmpty { o.folder = a }
+                else { print("Unexpected argument: \(a)"); exit(1) }
+            }
+            i += 1
+        }
+        return o
+    }
+
+    private static func printUsage() {
+        print("""
+        OCR Benchmark — measure Apple Vision text recognition performance
+
+        Usage:
+          swift run OCRBenchmark <folder-path> [options]
+
+        Options:
+          --json [path]       Output in JSON format (optionally save to file)
+          --fast              Use .fast recognition level (parallel, 2-3x faster, may miss text)
+          --sequential        Process images one at a time (baseline comparison)
+          --concurrency N     Set parallel OCR concurrency (default 4; max 16)
+          --sweep             Sweep concurrency over 1,2,3,4,5,6,8 and print a table
+          --adaptive          Fast probe → retry accurate on low-confidence items; compares vs always-accurate
+          --adaptive-threshold T  Retry when mean confidence < T (default 0.75; range 0-1)
+          --auto-lang         Enable automatic language detection per image
+          --lang LIST         Comma-separated recognition languages, e.g. ms-MY,en-US (priority order)
+          --legacy-engine     Force the legacy RecognizeTextRequest engine even on macOS 26
+          --resize-to N       Downscale images to longest side N px before OCR
+          --resize-sweep      Sweep resolutions 512…4096 (+native) vs CER/WER/latency/throughput
+          --references DIR    Compute CER/WER/exact-match against <basename>.txt files in DIR
+          --help, -h          Show this help
+
+        Modes (default: accurate + parallel):
+          (no flags)          Accurate + parallel
+          --fast              Fast + parallel
+          --sequential        Accurate + sequential (baseline)
+          --concurrency 8     Accurate + parallel with 8 concurrent requests
+          --adaptive          Fast + retry-accurate cascade (benchmarked vs always-accurate)
+          --resize-sweep      Accuracy/latency vs input resolution
+
+        Accuracy:
+          For each image `<name>.<ext>`, the reference file `<name>.txt` is loaded from
+          the --references directory and used to compute Character Error Rate (CER),
+          Word Error Rate (WER), and exact-match ratio.
+
+        Examples:
+          swift run OCRBenchmark ~/Screenshots
+          swift run OCRBenchmark ~/Screenshots --fast
+          swift run OCRBenchmark ~/Screenshots --sequential
+          swift run OCRBenchmark ~/Screenshots --concurrency 6 --json results.json
+          swift run OCRBenchmark ~/Screenshots --sweep --json sweep.json
+          swift run OCRBenchmark ~/Screenshots --adaptive --json adaptive.json
+          swift run OCRBenchmark ~/Screenshots --adaptive --adaptive-threshold 0.8
+          swift run OCRBenchmark ~/Screenshots --resize-sweep --references ~/gt --json resize.json
+          swift run OCRBenchmark ~/Screenshots --lang ms-MY,en-US --json results.json
+          swift run OCRBenchmark ~/Screenshots --legacy-engine --json results.json
+          swift run OCRBenchmark ~/Screenshots --references ~/gt --json results.json
+        """)
     }
 
     enum Format {

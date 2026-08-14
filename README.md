@@ -19,6 +19,10 @@ Engine (ANE). Built-in LAN HTTP server for OCR automation on the local network.
 - **Copy & Save** — Copy individual file text, copy all, save all as `.txt`
 - **Clear** — Reset to initial state
 - **Network Server** — In-process LAN HTTP server for local OCR automation
+- **Agent API** — `POST /ocr` with an `options` JSON field returns structured
+  blocks + confidence and supports `fast`/`accurate`/`adaptive` modes, language
+  selection, custom vocabulary, a retry confidence threshold, and region-aware
+  small-text upscaling (`enhance_small_text`)
 - **Web camera capture** — Take a photo in the web UI (requires HTTPS via your
   reverse proxy) and OCR it with the same pipeline
 - **History tab** — Records past OCR runs
@@ -113,9 +117,39 @@ swift run -c release OCRBenchmark ~/Screenshots --fast
 # Accurate + sequential (baseline)
 swift run -c release OCRBenchmark ~/Screenshots --sequential
 
-# JSON output
+# Set concurrency explicitly (max 16)
+swift run -c release OCRBenchmark ~/Screenshots --concurrency 6
+
+# Sweep concurrency 1,2,3,4,5,6,8 → find the real optimum
+swift run -c release OCRBenchmark ~/Screenshots --sweep --json sweep.json
+
+# Resolution sweep 512…4096 (+native) vs CER/WER/latency/throughput
+swift run -c release OCRBenchmark ~/Screenshots --resize-sweep --references ~/gt --json resize.json
+
+# Adaptive cascade: fast probe → retry accurate on low-confidence items,
+# benchmarked against always-accurate (throughput, p95, CER/WER)
+swift run -c release OCRBenchmark ~/Screenshots --adaptive --json adaptive.json
+
+# Languages / engine pinning / downscaling
+swift run -c release OCRBenchmark ~/Screenshots --lang ms-MY,en-US --json results.json
+swift run -c release OCRBenchmark ~/Screenshots --legacy-engine --json results.json
+swift run -c release OCRBenchmark ~/Screenshots --resize-to 1024 --json results.json
+
+# Accuracy: CER/WER/exact-match against <basename>.txt ground truth
+swift run -c release OCRBenchmark ~/Screenshots --references ~/gt --json results.json
+
+# JSON output (also records OS, SoC, RAM, Vision revision, p50/p95/p99)
 swift run -c release OCRBenchmark ~/Screenshots --json results.json
 ```
+
+Benchmark JSON now records the environment (OS, device model, SoC, RAM), the OCR
+configuration (recognition level, languages, concurrency, Vision revision,
+engine pinning), per-file latency percentiles (p50/p95/p99), and — with
+`--references` — CER/WER/exact match against ground truth. `--sweep` and
+`--resize-sweep` expose concurrency and input resolution as measured dimensions
+instead of assuming the hard-coded defaults are optimal. `--legacy-engine`
+forces the `RecognizeTextRequest` path even on macOS 26 so engine-dependent
+comparisons stay apples-to-apples.
 
 Repeated runs with stats:
 ```bash

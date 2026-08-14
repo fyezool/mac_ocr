@@ -192,6 +192,75 @@ task.resume()
 
 ---
 
+## Agent API (structured output)
+
+Add an `options` multipart field (JSON) to `POST /ocr` to get structured results
+(per-line blocks with confidence + normalized bounding boxes) and control the
+recognition pipeline.
+
+### Request
+
+```
+POST /ocr HTTP/1.1
+Content-Type: multipart/form-data; boundary=<boundary>
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `image` | File | Yes | Image file. Repeat for multiple files. |
+| `options` | Text | No | JSON with the fields below. |
+
+`options` JSON (snake_case accepted):
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `mode` | `"accurate"` | `"accurate"`, `"fast"`, or `"adaptive"` (fast probe → retry accurate below the threshold) |
+| `languages` | `["en-US"]` | Priority-ordered recognition languages, e.g. `["ms-MY","en-US"]` |
+| `custom_words` | `[]` | Domain vocabulary to bias recognition |
+| `confidence_threshold` | `0.75` | Items below this mean confidence are retried in `adaptive` mode |
+| `structured` | `true` | `true` → blocks/confidence response; `false` → plain text |
+| `enhance_small_text` | `false` | Crop small-text blocks, upscale, and re-recognize them (region-aware ROI) |
+
+### Example
+
+```bash
+curl -X POST \
+  -F 'options={"mode":"adaptive","languages":["ms-MY","en-US"],"confidence_threshold":0.8,"custom_words":["Sdn Bhd","SST"]}' \
+  -F "image=@receipt.png" \
+  http://<server-ip>:8080/ocr
+```
+
+### Response (structured)
+
+```json
+{
+  "results": [
+    {
+      "filename": "receipt.png",
+      "text": "…layout-preserving transcript…",
+      "error": null,
+      "duration": 0.41,
+      "confidence": 0.94,
+      "blocks": [
+        {
+          "text": "Sdn Bhd",
+          "confidence": 0.99,
+          "rect": [0.129, 0.972, 0.22, 0.014]
+        }
+      ]
+    }
+  ],
+  "server_duration_seconds": 0.42,
+  "strategy": "adaptive",
+  "engine": "vision"
+}
+```
+
+`strategy` reports the mode used. Without an `options` field, `POST /ocr`
+behaves exactly as documented above.
+
+---
+
 ## `GET /` (after POST)
 
 After submitting to `/ocr`, the results page includes:
@@ -225,6 +294,9 @@ clipboard.
 | `400` | Bad Request | Missing or invalid multipart data |
 | `400` | `{"error":"Expected multipart"}` | No multipart boundary found |
 | `400` | `{"error":"No image"}` | No file with field name `image` |
+| `400` | `{"error":"Invalid file content: <name>"}` | Uploaded bytes don't match the claimed extension (magic-byte check failed) |
+| `413` | `{"error":"File too large (max 16MB)"}` | A single file exceeds 16MB |
+| `413` | `{"error":"Too many files"}` | More than 16 files in one request |
 | `500` | `{"error":"Write failed"}` | Could not save uploaded file to temp |
 | `404` | Not Found | Unknown route |
 

@@ -223,7 +223,8 @@ final class ServerManager: NSObject, @unchecked Sendable {
         }
         defer { ocrLimit.signal() }
         guard let b = req.boundary else { sendAndClose(fd, 400, "{\"success\":false,\"error\":\"Expected multipart\"}", "application/json"); return }
-        let files = parseMultiAll(req.body, b)
+        let parsed = parseMultiAll(req.body, b)
+        let files = parsed.files
         guard !files.isEmpty else { sendAndClose(fd, 400, "{\"success\":false,\"error\":\"No image\"}", "application/json"); return }
         guard files.count <= 16 else {
             sendAndClose(fd, 413, "{\"success\":false,\"error\":\"Too many files\"}", "application/json")
@@ -237,6 +238,16 @@ final class ServerManager: NSObject, @unchecked Sendable {
             return
         }
 
+        // Content validation: reject files whose magic bytes don't match the
+        // claimed extension before anything is written to disk.
+        if let invalid = files.first(where: { !hasValidContent($0.data, ext: ($0.name as NSString).pathExtension.lowercased()) }) {
+            let safeName = invalid.name
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            sendAndClose(fd, 400, "{\"success\":false,\"error\":\"Invalid file content: \(safeName)\"}", "application/json")
+            return
+        }
+
         var tmpFiles: [(String, URL)] = []
         for f in files {
             let ext = (f.name as NSString).pathExtension.lowercased()
@@ -244,6 +255,17 @@ final class ServerManager: NSObject, @unchecked Sendable {
             if (try? f.data.write(to: tmp)) != nil { tmpFiles.append((f.name, tmp)) }
         }
         guard !tmpFiles.isEmpty else { sendAndClose(fd, 500, "{\"success\":false,\"error\":\"Write failed\"}", "application/json"); return }
+
+        // Agent API: an optional `options` multipart field switches to structured
+        // (blocks + confidence) output with mode/language/threshold control.
+        if let optionsJSON = parsed.optionsJSON {
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            if let agent = try? decoder.decode(AgentOptions.self, from: Data(optionsJSON.utf8)) {
+                handleAgentOCR(fd, ip, start, tmpFiles: tmpFiles, agent: agent, format: format)
+                return
+            }
+        }
 
         var allResults: [OCRItem] = []
         let sem = DispatchSemaphore(value: 0)
@@ -255,7 +277,19 @@ final class ServerManager: NSObject, @unchecked Sendable {
         sem.wait()
 
         let el = CFAbsoluteTimeGetCurrent() - start
-        let results = allResults.isEmpty ? files.map { OCRItem(filename: $0.name, text: "", error: "No result", duration: 0) } : allResults
+        // OCRService reports the temp UUID filenames; remap them back to the
+        // original uploaded names (preserving " (page N)" suffixes for PDFs).
+        let nameMap = Dictionary(uniqueKeysWithValues: tmpFiles.map { ($0.1.lastPathComponent, $0.0) })
+        func mappedFilename(_ filename: String) -> String {
+            if let range = filename.range(of: " (page ") {
+                let base = String(filename[..<range.lowerBound])
+                guard let orig = nameMap[base] else { return filename }
+                return orig + String(filename[range.lowerBound...])
+            }
+            return nameMap[filename] ?? filename
+        }
+        let results = (allResults.isEmpty ? files.map { OCRItem(filename: $0.name, text: "", error: "No result", duration: 0) } : allResults)
+            .map { r in OCRItem(filename: mappedFilename(r.filename), text: r.text, error: r.error, duration: r.duration) }
         let totalDuration = results.reduce(0.0) { $0 + $1.duration }
 
         // Handle format selection
@@ -299,6 +333,85 @@ final class ServerManager: NSObject, @unchecked Sendable {
         log("POST", "/ocr", ip, "\(results.count) files", el, 200)
     }
 
+    /// Agent API: structured OCR honoring mode / languages / custom_words /
+    /// confidence_threshold / structured. mode "adaptive" runs a fast probe and
+    /// retries low-confidence items with accurate recognition.
+    private func handleAgentOCR(_ fd: Int32, _ ip: String, _ start: CFAbsoluteTime, tmpFiles: [(String, URL)], agent: AgentOptions, format: String) {
+        var config = OCRConfiguration.default
+        if agent.mode == "fast" { config.recognitionLevel = .fast }
+        if let langs = agent.languages, !langs.isEmpty { config.recognitionLanguages = langs.map { Locale.Language(identifier: $0) } }
+        if let words = agent.customWords, !words.isEmpty { config.customWords = words }
+        if agent.enhanceSmallText == true { config.enhanceSmallText = true }
+        config.maxConcurrency = 2
+        let threshold = agent.confidenceThreshold ?? 0.75
+
+        let paths = tmpFiles.map { $0.1.path }
+        let nameMap = Dictionary(uniqueKeysWithValues: tmpFiles.map { ($0.1.lastPathComponent, $0.0) })
+        func mappedFilename(_ filename: String) -> String {
+            if let range = filename.range(of: " (page ") {
+                let base = String(filename[..<range.lowerBound])
+                guard let orig = nameMap[base] else { return filename }
+                return orig + String(filename[range.lowerBound...])
+            }
+            return nameMap[filename] ?? filename
+        }
+
+        var finalItems: [OCRStructuredItem] = []
+        let sem = DispatchSemaphore(value: 0)
+        Task.detached {
+            if agent.mode == "adaptive" {
+                var fastCfg = config
+                fastCfg.recognitionLevel = .fast
+                let fastItems = await OCRService.recognizeTextStructured(paths: paths, config: fastCfg)
+                let pathByKey = Dictionary(uniqueKeysWithValues: tmpFiles.map { ($0.1.lastPathComponent, $0.1.path) })
+                var retryPaths: [String] = []
+                for item in fastItems {
+                    let base: String
+                    if let r = item.filename.range(of: " (page ") { base = String(item.filename[..<r.lowerBound]) }
+                    else { base = item.filename }
+                    guard let p = pathByKey[base] else { continue }
+                    if item.text.isEmpty || (item.confidence ?? 0) < threshold { retryPaths.append(p) }
+                }
+                let accurateItems = retryPaths.isEmpty ? [] : await OCRService.recognizeTextStructured(paths: retryPaths, config: config)
+                var accurateByFilename: [String: OCRStructuredItem] = [:]
+                for it in accurateItems { accurateByFilename[it.filename] = it }
+                finalItems = fastItems.map { accurateByFilename[$0.filename] ?? $0 }
+            } else {
+                finalItems = await OCRService.recognizeTextStructured(paths: paths, config: config)
+            }
+            for (_, url) in tmpFiles { try? FileManager.default.removeItem(at: url) }
+            sem.signal()
+        }
+        sem.wait()
+
+        let el = CFAbsoluteTimeGetCurrent() - start
+        let mapped = finalItems.map { it in
+            OCRStructuredItem(filename: mappedFilename(it.filename), text: it.text, error: it.error, duration: it.duration, confidence: it.confidence, blocks: it.blocks)
+        }
+
+        if format == "txt" {
+            var txt = ""
+            for r in mapped { txt += "--- \(r.filename) ---\n\(r.text)\n\n" }
+            sendAndClose(fd, 200, txt, "text/plain; charset=utf-8")
+            log("POST", "/ocr", ip, "\(mapped.count) files", el, 200)
+            return
+        }
+        if format == "html" && agent.structured == false {
+            var body = ""
+            for r in mapped {
+                body += "<h2>" + esc(r.filename) + "</h2><pre>" + esc(r.text.isEmpty ? "(no text)" : r.text) + "</pre>"
+            }
+            let html = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><title>OCR Results</title></head><body>" + body + "</body></html>"
+            sendAndClose(fd, 200, html, "text/html; charset=utf-8")
+            log("POST", "/ocr", ip, "\(mapped.count) files", el, 200)
+            return
+        }
+        let resp = StructuredBatchResponse(results: mapped, server_duration_seconds: el, strategy: agent.mode ?? "accurate", engine: "vision")
+        let json = ((try? JSONEncoder().encode(resp)).flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
+        sendAndClose(fd, 200, json, "application/json")
+        log("POST", "/ocr", ip, "\(mapped.count) files", el, 200)
+    }
+
     private func esc(_ s: String) -> String {
         s.replacingOccurrences(of: "&", with: "&amp;")
             .replacingOccurrences(of: "<", with: "&lt;")
@@ -340,9 +453,13 @@ final class ServerManager: NSObject, @unchecked Sendable {
     // MARK: - Multipart
 
     struct UFile { let name: String; let data: Data }
-    private func parseMultiAll(_ body: Data, _ boundary: String) -> [UFile] {
-        let bm = "--\(boundary)".data(using: .utf8)!
+    struct ParsedUpload {
         var files: [UFile] = []
+        var optionsJSON: String?
+    }
+    private func parseMultiAll(_ body: Data, _ boundary: String) -> ParsedUpload {
+        let bm = "--\(boundary)".data(using: .utf8)!
+        var parsed = ParsedUpload()
         var pos = body.startIndex
         while pos < body.endIndex {
             guard let bs = body[pos...].range(of: bm) else { break }
@@ -352,8 +469,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
             else if let e = body[ps...].range(of: "--\(boundary)--".data(using: .utf8)!) { pe = e.lowerBound }
             let part = body[ps..<pe]
             if let cr = part.range(of: "\r\n\r\n".data(using: .utf8)!),
-               let h = String(data: part[part.startIndex..<cr.lowerBound], encoding: .utf8),
-               h.contains("name=\"image\"") {
+               let h = String(data: part[part.startIndex..<cr.lowerBound], encoding: .utf8) {
                 let raw = Data(part[cr.upperBound...])
                 let content: Data
                 if raw.count >= 2, raw[raw.count-2] == 13, raw[raw.count-1] == 10 {
@@ -361,15 +477,52 @@ final class ServerManager: NSObject, @unchecked Sendable {
                 } else {
                     content = raw
                 }
-                files.append(UFile(name: extractFN(h) ?? "upload", data: content))
+                if h.contains("name=\"image\"") {
+                    parsed.files.append(UFile(name: extractFN(h) ?? "upload", data: content))
+                } else if h.contains("name=\"options\"") {
+                    parsed.optionsJSON = String(data: content, encoding: .utf8)
+                }
             }
             pos = pe
         }
-        return files
+        return parsed
     }
     private func extractFN(_ d: String) -> String? {
         guard let r = d.range(of: "filename=\"") else { return nil }
         let a = d[r.upperBound...]; return a.firstIndex(of: "\"").map { String(a[a.startIndex..<$0]) }
+    }
+
+    /// Verify uploaded file content against its claimed extension using magic
+    /// bytes. Rejects mismatched, truncated, or non-image/PDF payloads.
+    private func hasValidContent(_ data: Data, ext: String) -> Bool {
+        guard data.count >= 12 else { return false }
+        let prefix = [UInt8](data.prefix(16))
+        switch ext {
+        case "png":
+            return Array(prefix.prefix(8)) == [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        case "jpg", "jpeg":
+            return Array(prefix.prefix(3)) == [0xFF, 0xD8, 0xFF]
+        case "gif":
+            return Array(prefix.prefix(4)) == Array("GIF8".utf8)
+        case "bmp":
+            return Array(prefix.prefix(2)) == Array("BM".utf8)
+        case "tif", "tiff":
+            let header = Array(prefix.prefix(4))
+            return header == [0x49, 0x49, 0x2A, 0x00] || header == [0x4D, 0x4D, 0x00, 0x2A]
+        case "heic":
+            guard prefix.count >= 12, Array(prefix[4..<8]) == Array("ftyp".utf8) else { return false }
+            let brand = String(decoding: prefix[8..<12], as: UTF8.self)
+            return ["heic", "heix", "hevc", "hevx", "mif1", "msf1"].contains(brand)
+        case "webp":
+            return Array(prefix.prefix(4)) == Array("RIFF".utf8)
+                && data.count >= 12
+                && [UInt8](data[data.startIndex + 8 ..< data.startIndex + 12]) == Array("WEBP".utf8)
+        case "pdf":
+            // Per the PDF spec the header may appear within the first 1024 bytes.
+            return data.prefix(1024).range(of: Data("%PDF-".utf8)) != nil
+        default:
+            return false
+        }
     }
 }
 
@@ -383,6 +536,25 @@ private struct OCRResp: Codable {
 private struct BatchOCRResponse: Codable {
     let results: [OCRItem]
     let server_duration_seconds: Double
+}
+
+/// Agent API request options (multipart field `options`). Decoded with
+/// `.convertFromSnakeCase`, so `confidence_threshold` and `custom_words` work.
+private struct AgentOptions: Codable {
+    let mode: String?
+    let languages: [String]?
+    let customWords: [String]?
+    let confidenceThreshold: Double?
+    let structured: Bool?
+    let enhanceSmallText: Bool?
+}
+
+/// Structured agent API response: per-file blocks + confidence.
+private struct StructuredBatchResponse: Codable {
+    let results: [OCRStructuredItem]
+    let server_duration_seconds: Double
+    let strategy: String
+    let engine: String
 }
 
 private struct Req {
