@@ -58,7 +58,17 @@ public final class ServerManager: NSObject, @unchecked Sendable {
     public var port: UInt16 = 8080
     private(set) public var address: String = "127.0.0.1"
     private let connectionLimit = DispatchSemaphore(value: 16)
-    private let ocrLimit = DispatchSemaphore(value: 2)
+    private let ocrGateLock = NSLock()
+    private var ocrActive = 0
+    private func tryAcquireOCR() -> Bool {
+        ocrGateLock.lock(); defer { ocrGateLock.unlock() }
+        guard ocrActive < 2 else { return false }
+        ocrActive += 1
+        return true
+    }
+    private func releaseOCR() {
+        ocrGateLock.lock(); ocrActive -= 1; ocrGateLock.unlock()
+    }
     public var urlString: String { "http://\(address):\(port)" }
     public var recentLog: [ServerLogEntry] {
         logLock.lock(); defer { logLock.unlock() }
@@ -143,9 +153,19 @@ public final class ServerManager: NSObject, @unchecked Sendable {
             let ip = String(cString: inet_ntoa(ca.sin_addr))
             srv.trackClient(cf, ip: ip)
             srv.queue.async {
-                defer { srv.connectionLimit.signal() }
-                srv.handle(cf, ip: ip)
-                srv.untrackClient(cf)
+                // Phase 1: blocking socket read on this dispatch thread.
+                guard let pair = srv.readRequest(cf) else {
+                    srv.untrackClient(cf)
+                    srv.connectionLimit.signal()
+                    return
+                }
+                // Phase 2: async processing (OCR awaits) on the cooperative pool;
+                // the connection slot stays held until the response is sent.
+                Task {
+                    await srv.process(cf, req: pair.0, ip: ip, start: pair.1)
+                    srv.untrackClient(cf)
+                    srv.connectionLimit.signal()
+                }
             }
         } }
         source?.setCancelHandler { Darwin.close(fd) }
@@ -157,7 +177,7 @@ public final class ServerManager: NSObject, @unchecked Sendable {
 
     private func _stop() { source?.cancel(); source = nil; sockfd = -1; running = false; DispatchQueue.main.async { self.notifyStatus() } }
 
-    private func handle(_ fd: Int32, ip: String) {
+    private func readRequest(_ fd: Int32) -> (req: HTTPRequest, start: CFAbsoluteTime)? {
         var buf = Data(); var tmp = [UInt8](repeating: 0, count: 65536)
         var attempts = 0
         var hdrEndPos = -1
@@ -194,11 +214,15 @@ public final class ServerManager: NSObject, @unchecked Sendable {
             if hdrEndPos >= 0, contentLength >= 0, buf.count - hdrEndPos >= contentLength { break }
             if hdrEndPos >= 0, contentLength < 0 { break }
         }
-        guard buf.count > 0 else { Darwin.close(fd); return }
-        if timedOut { sendAndClose(fd, 408, "Request timeout", "text/plain"); return }
-        if tooLarge { sendAndClose(fd, 413, "Request too large", "text/plain"); return }
+        guard buf.count > 0 else { Darwin.close(fd); return nil }
+        if timedOut { sendAndClose(fd, 408, "Request timeout", "text/plain"); return nil }
+        if tooLarge { sendAndClose(fd, 413, "Request too large", "text/plain"); return nil }
         let start = CFAbsoluteTimeGetCurrent()
-        guard let req = HTTPRequest(data: buf) else { sendAndClose(fd, 400, "Bad Request", "text/plain"); return }
+        guard let req = HTTPRequest(data: buf) else { sendAndClose(fd, 400, "Bad Request", "text/plain"); return nil }
+        return (req, start)
+    }
+
+    private func process(_ fd: Int32, req: HTTPRequest, ip: String, start: CFAbsoluteTime) async {
         updateClientPath(fd, path: req.path)
         let fmt = ServerSupport.parseFormat(from: req.path)
         let isFast = req.path.contains("?fast=1") || req.path.contains("&fast=1")
@@ -215,7 +239,7 @@ public final class ServerManager: NSObject, @unchecked Sendable {
                 sendAndClose(fd, 400, "Invalid Content-Length", "text/plain")
                 return
             }
-            handleOCR(fd, req, ip, start, format: fmt, fast: isFast)
+            await handleOCR(fd, req, ip, start, format: fmt, fast: isFast)
         case ("OPTIONS", _):
             sendAndClose(fd, 204, "", "text/plain")
         default:
@@ -227,12 +251,12 @@ public final class ServerManager: NSObject, @unchecked Sendable {
         send(fd, status, body, ct); Darwin.close(fd)
     }
 
-    private func handleOCR(_ fd: Int32, _ req: HTTPRequest, _ ip: String, _ start: CFAbsoluteTime, format: String = "html", fast: Bool = false) {
-        guard ocrLimit.wait(timeout: .now()) == .success else {
+    private func handleOCR(_ fd: Int32, _ req: HTTPRequest, _ ip: String, _ start: CFAbsoluteTime, format: String = "html", fast: Bool = false) async {
+        guard tryAcquireOCR() else {
             sendAndClose(fd, 429, "OCR capacity reached", "text/plain")
             return
         }
-        defer { ocrLimit.signal() }
+        defer { releaseOCR() }
         guard let b = req.boundary else { sendAndClose(fd, 400, "{\"success\":false,\"error\":\"Expected multipart\"}", "application/json"); return }
         let parsed = ServerSupport.parseMultipart(req.body, boundary: b)
         let files = parsed.files
@@ -273,19 +297,13 @@ public final class ServerManager: NSObject, @unchecked Sendable {
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             if let agent = try? decoder.decode(AgentOptions.self, from: Data(optionsJSON.utf8)) {
-                handleAgentOCR(fd, ip, start, tmpFiles: tmpFiles, agent: agent, format: format)
+                await handleAgentOCR(fd, ip, start, tmpFiles: tmpFiles, agent: agent, format: format)
                 return
             }
         }
 
-        var allResults: [OCRItem] = []
-        let sem = DispatchSemaphore(value: 0)
-        Task.detached {
-            allResults = await OCRService.recognizeText(paths: tmpFiles.map { $0.1.path }, fast: fast)
-            for (_, url) in tmpFiles { try? FileManager.default.removeItem(at: url) }
-            sem.signal()
-        }
-        sem.wait()
+        let allResults = await OCRService.recognizeText(paths: tmpFiles.map { $0.1.path }, fast: fast)
+        for (_, url) in tmpFiles { try? FileManager.default.removeItem(at: url) }
 
         let el = CFAbsoluteTimeGetCurrent() - start
         // OCRService reports the temp UUID filenames; remap them back to the
@@ -339,7 +357,7 @@ public final class ServerManager: NSObject, @unchecked Sendable {
     /// Agent API: structured OCR honoring mode / languages / custom_words /
     /// confidence_threshold / structured. mode "adaptive" runs a fast probe and
     /// retries low-confidence items with accurate recognition.
-    private func handleAgentOCR(_ fd: Int32, _ ip: String, _ start: CFAbsoluteTime, tmpFiles: [(String, URL)], agent: AgentOptions, format: String) {
+    private func handleAgentOCR(_ fd: Int32, _ ip: String, _ start: CFAbsoluteTime, tmpFiles: [(String, URL)], agent: AgentOptions, format: String) async {
         var config = OCRConfiguration.default
         if agent.mode == "fast" { config.recognitionLevel = .fast }
         if let langs = agent.languages, !langs.isEmpty { config.recognitionLanguages = langs.map { Locale.Language(identifier: $0) } }
@@ -351,37 +369,32 @@ public final class ServerManager: NSObject, @unchecked Sendable {
         let paths = tmpFiles.map { $0.1.path }
         let nameMap = Dictionary(uniqueKeysWithValues: tmpFiles.map { ($0.1.lastPathComponent, $0.0) })
 
-        var finalItems: [OCRStructuredItem] = []
-        let sem = DispatchSemaphore(value: 0)
-        Task.detached {
-            if agent.mode == "adaptive" {
-                var fastCfg = config
-                fastCfg.recognitionLevel = .fast
-                let fastItems = await OCRService.recognizeTextStructured(paths: paths, config: fastCfg)
-                let pathByKey = Dictionary(uniqueKeysWithValues: tmpFiles.map { ($0.1.lastPathComponent, $0.1.path) })
-                var retryPaths: [String] = []
-                for item in fastItems {
-                    let base: String
-                    if let r = item.filename.range(of: " (page ") { base = String(item.filename[..<r.lowerBound]) }
-                    else { base = item.filename }
-                    guard let p = pathByKey[base] else { continue }
-                    let blockMin = item.blocks.map(\.confidence).min() ?? 1
-                    let lowRatio = item.blocks.isEmpty ? 0 : Double(item.blocks.filter { $0.confidence < 0.5 }.count) / Double(item.blocks.count)
-                    if item.text.isEmpty || (item.confidence ?? 0) < threshold || blockMin < 0.4 || lowRatio > 0.25 {
-                        retryPaths.append(p)
-                    }
+        let finalItems: [OCRStructuredItem]
+        if agent.mode == "adaptive" {
+            var fastCfg = config
+            fastCfg.recognitionLevel = .fast
+            let fastItems = await OCRService.recognizeTextStructured(paths: paths, config: fastCfg)
+            let pathByKey = Dictionary(uniqueKeysWithValues: tmpFiles.map { ($0.1.lastPathComponent, $0.1.path) })
+            var retryPaths: [String] = []
+            for item in fastItems {
+                let base: String
+                if let r = item.filename.range(of: " (page ") { base = String(item.filename[..<r.lowerBound]) }
+                else { base = item.filename }
+                guard let p = pathByKey[base] else { continue }
+                let blockMin = item.blocks.map(\.confidence).min() ?? 1
+                let lowRatio = item.blocks.isEmpty ? 0 : Double(item.blocks.filter { $0.confidence < 0.5 }.count) / Double(item.blocks.count)
+                if item.text.isEmpty || (item.confidence ?? 0) < threshold || blockMin < 0.4 || lowRatio > 0.25 {
+                    retryPaths.append(p)
                 }
-                let accurateItems = retryPaths.isEmpty ? [] : await OCRService.recognizeTextStructured(paths: retryPaths, config: config)
-                var accurateByFilename: [String: OCRStructuredItem] = [:]
-                for it in accurateItems { accurateByFilename[it.filename] = it }
-                finalItems = fastItems.map { accurateByFilename[$0.filename] ?? $0 }
-            } else {
-                finalItems = await OCRService.recognizeTextStructured(paths: paths, config: config)
             }
-            for (_, url) in tmpFiles { try? FileManager.default.removeItem(at: url) }
-            sem.signal()
+            let accurateItems = retryPaths.isEmpty ? [] : await OCRService.recognizeTextStructured(paths: retryPaths, config: config)
+            var accurateByFilename: [String: OCRStructuredItem] = [:]
+            for it in accurateItems { accurateByFilename[it.filename] = it }
+            finalItems = fastItems.map { accurateByFilename[$0.filename] ?? $0 }
+        } else {
+            finalItems = await OCRService.recognizeTextStructured(paths: paths, config: config)
         }
-        sem.wait()
+        for (_, url) in tmpFiles { try? FileManager.default.removeItem(at: url) }
 
         let el = CFAbsoluteTimeGetCurrent() - start
         let mapped = finalItems.map { it in
