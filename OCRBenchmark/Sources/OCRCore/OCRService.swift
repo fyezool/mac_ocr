@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Vision
 import PDFKit
 import ImageIO
@@ -185,6 +186,72 @@ public enum ConcurrencyPolicy: Sendable {
     }
 }
 
+/// FIFO async semaphore bounding process-wide in-flight Vision `perform` calls.
+/// Uses `OSAllocatedUnfairLock` (not an actor) so the limit can be raised
+/// synchronously from a non-async `main` and released via `defer`.
+private final class VisionGate: @unchecked Sendable {
+    private struct State {
+        var limit: Int
+        var active = 0
+        var waiters: [CheckedContinuation<Void, Never>] = []
+    }
+
+    private let lock = OSAllocatedUnfairLock(initialState: State(limit: 4))
+
+    init(limit: Int) {
+        lock.withLock { $0.limit = max(1, limit) }
+    }
+
+    /// Async-acquire; returns immediately while under the budget, otherwise
+    /// suspends until a slot frees up (FIFO).
+    func acquire() async {
+        let granted = lock.withLock { state -> Bool in
+            if state.active < state.limit {
+                state.active += 1
+                return true
+            }
+            return false
+        }
+        if granted { return }
+        await withCheckedContinuation { cont in
+            lock.withLock { state in state.waiters.append(cont) }
+        }
+    }
+
+    /// Sync release — safe to call from `defer` in an async context.
+    func release() {
+        let toResume = lock.withLock { state -> [CheckedContinuation<Void, Never>] in
+            if state.active > 0 { state.active -= 1 }
+            var admitted: [CheckedContinuation<Void, Never>] = []
+            while state.active < state.limit, !state.waiters.isEmpty {
+                state.active += 1
+                admitted.append(state.waiters.removeFirst())
+            }
+            return admitted
+        }
+        for cont in toResume { cont.resume() }
+    }
+
+    /// Raise the budget, admitting any waiters that now fit.
+    func setLimit(_ newLimit: Int) {
+        let toResume = lock.withLock { state -> [CheckedContinuation<Void, Never>] in
+            state.limit = max(1, newLimit)
+            var admitted: [CheckedContinuation<Void, Never>] = []
+            while state.active < state.limit, !state.waiters.isEmpty {
+                state.active += 1
+                admitted.append(state.waiters.removeFirst())
+            }
+            return admitted
+        }
+        for cont in toResume { cont.resume() }
+    }
+
+    /// Current budget (for reporting).
+    func currentLimit() -> Int {
+        lock.withLock { $0.limit }
+    }
+}
+
 public enum OCRService {
 
     /// Stability limit for single-file memory ingestion (MAX_FILE_SIZE_INGEST).
@@ -197,6 +264,30 @@ public enum OCRService {
     /// Cap on decoded pixels per image. Compressed bytes ≠ decoded memory, so
     /// oversized images are downscaled before Vision sees them.
     public static let maxDecodedPixels = 25_000_000
+
+    // MARK: - Global Vision request budget
+
+    /// Conservative process-wide cap on in-flight Vision `perform` calls.
+    /// Vision's Core ML/ANE backend degrades past ~4 concurrent requests
+    /// (working-set cliff + Jetsam risk — see docs/ANE_ENGINEERING_RULESET.md).
+    /// The per-invocation `maxConcurrency` clamp only bounds a single call; this
+    /// gate bounds the *sum* across the app UI, the HTTP server, and the
+    /// benchmark running in the same process.
+    public static let defaultVisionConcurrency = 4
+
+    private static let visionGate = VisionGate(limit: OCRService.defaultVisionConcurrency)
+
+    /// Raise the process-wide Vision request budget. The benchmark opts into a
+    /// higher budget (its safety ceiling is 16) so the concurrency sweep stays
+    /// meaningful; the app keeps the conservative default.
+    public static func setVisionConcurrencyLimit(_ limit: Int) {
+        visionGate.setLimit(limit)
+    }
+
+    /// Current process-wide Vision request budget (for reporting).
+    public static func visionConcurrencyLimit() -> Int {
+        visionGate.currentLimit()
+    }
 
     /// Clamp a requested concurrency into the safe band [1, ceiling] for the
     /// given policy. The benchmark needs to sweep beyond the production-safe
@@ -434,6 +525,8 @@ public enum OCRService {
         request.automaticallyDetectsLanguage = config.automaticallyDetectsLanguage
         if !config.recognitionLanguages.isEmpty { request.recognitionLanguages = config.recognitionLanguages }
         if !config.customWords.isEmpty { request.customWords = config.customWords }
+        await visionGate.acquire()
+        defer { visionGate.release() }
         let observations = try await request.perform(on: data)
         let result = reconstructParagraphsWithConfidence(from: observations)
         return (result.text, result.stats)
@@ -490,6 +583,8 @@ public enum OCRService {
                 if !config.customWords.isEmpty { opts.customWords = config.customWords }
                 if config.minimumTextHeight > 0 { opts.minimumTextHeightFraction = config.minimumTextHeight }
                 request.textRecognitionOptions = opts
+                await visionGate.acquire()
+                defer { visionGate.release() }
                 let observations = try await request.perform(on: data)
                 if let doc = observations.first?.document, !doc.text.transcript.isEmpty {
                     return reconstructDocumentText(from: doc)
@@ -505,6 +600,8 @@ public enum OCRService {
         request.automaticallyDetectsLanguage = config.automaticallyDetectsLanguage
         if !config.recognitionLanguages.isEmpty { request.recognitionLanguages = config.recognitionLanguages }
         if !config.customWords.isEmpty { request.customWords = config.customWords }
+        await visionGate.acquire()
+        defer { visionGate.release() }
         let observations = try await request.perform(on: data)
         return reconstructParagraphs(from: observations)
     }
@@ -790,6 +887,8 @@ public enum OCRService {
         request.automaticallyDetectsLanguage = config.automaticallyDetectsLanguage
         if !config.recognitionLanguages.isEmpty { request.recognitionLanguages = config.recognitionLanguages }
         if !config.customWords.isEmpty { request.customWords = config.customWords }
+        await visionGate.acquire()
+        defer { visionGate.release() }
         let observations = try await request.perform(on: data)
         let reconstruction = reconstructParagraphsWithConfidence(from: observations)
         let blocks = observations.compactMap { obs -> OCRBlock? in

@@ -44,6 +44,10 @@ struct OCRBenchmark {
     // MARK: - Entry
 
     static func main() async {
+        // The benchmark must be able to sweep concurrency up to its safety
+        // ceiling, so raise the process-wide Vision request budget from the
+        // conservative app default (4) to the benchmark ceiling (16).
+        OCRService.setVisionConcurrencyLimit(ConcurrencyPolicy.benchmark(maxConcurrent: 16).ceiling)
         let opts = parseOptions()
         if opts.help { printUsage(); exit(0) }
 
@@ -752,6 +756,7 @@ struct OCRBenchmark {
             "safety_ceiling": policy.ceiling,
             "policy": "benchmark",
             "benchmark_mode": true,
+            "global_vision_budget": OCRService.visionConcurrencyLimit(),
         ]
     }
 

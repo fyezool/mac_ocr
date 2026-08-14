@@ -120,6 +120,23 @@ final class OCRCoreTests: XCTestCase {
         XCTAssertEqual(OCRService.clampedConcurrency(8, policy: .benchmark(maxConcurrent: 16)), 8)
     }
 
+    // MARK: - Global Vision request budget
+
+    func testVisionBudgetDefaultsToProductionCeiling() {
+        XCTAssertEqual(OCRService.visionConcurrencyLimit(), OCRService.defaultVisionConcurrency)
+        XCTAssertEqual(OCRService.defaultVisionConcurrency, 4)
+    }
+
+    func testVisionBudgetCanBeRaisedAndRestored() {
+        let original = OCRService.visionConcurrencyLimit()
+        OCRService.setVisionConcurrencyLimit(16)
+        XCTAssertEqual(OCRService.visionConcurrencyLimit(), 16)
+        OCRService.setVisionConcurrencyLimit(1)
+        XCTAssertEqual(OCRService.visionConcurrencyLimit(), 1)
+        OCRService.setVisionConcurrencyLimit(original)
+        XCTAssertEqual(OCRService.visionConcurrencyLimit(), original)
+    }
+
     // MARK: - PDF render scale
 
     func testPDFRenderScaleLetter() {

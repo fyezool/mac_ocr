@@ -13,8 +13,11 @@ Engine (ANE). Built-in LAN HTTP server for OCR automation on the local network.
   available for native paragraph / table / list structure; falls back to
   bounding-box reconstruction on older systems
 - **Parallel processing** — Bounded concurrency (up to 4 requests in the app by
-  default) via `clampedConcurrency`; the bound reflects an empirically observed
-  working-set performance cliff, not a documented Apple hardware limit
+  default) via `clampedConcurrency`, enforced process-wide by a `VisionGate`
+  that caps total in-flight Vision requests across the app UI + HTTP server
+  (the benchmark raises the budget to its 16-way ceiling for `--sweep`); the
+  bound reflects an empirically observed working-set performance cliff, not a
+  documented Apple hardware limit
 - **Live timer** — Elapsed time shown during processing
 - **File dropdown** — Browse per-file results via dropdown on native and web UI
 - **Copy & Save** — Copy individual file text, copy all, save all as `.txt`
