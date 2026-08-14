@@ -24,6 +24,8 @@ struct OCRBenchmark {
         var resizeTo: Int?
         var resizeSweep = false
         var referencesDir: String?
+        var warmup = 0
+        var runs = 1
         var help = false
     }
 
@@ -79,6 +81,10 @@ struct OCRBenchmark {
         }
         if opts.resizeSweep && opts.resizeTo != nil {
             print("❌ --resize-sweep and --resize-to are mutually exclusive.")
+            exit(1)
+        }
+        if (opts.warmup > 0 || opts.runs > 1) && (opts.sweep || opts.adaptive || opts.adaptiveSweep || opts.resizeSweep) {
+            print("❌ --warmup/--runs apply to single-run mode only.")
             exit(1)
         }
         guard !opts.folder.isEmpty else { printUsage(); exit(1) }
@@ -145,14 +151,23 @@ struct OCRBenchmark {
     // MARK: - Single run
 
     private static func runSingle(images: [URL], options: RunOptions, levelLabel: String) async {
-        let concurrency = options.concurrency ?? (options.useSequential ? 1 : 4)
-        let modeLabel = options.useFast ? "fast + parallel" : (options.useSequential ? "accurate + sequential" : "accurate + parallel (\(concurrency))")
-        print("🔍 Running OCR on \(images.count) image(s) (\(modeLabel))…")
-        print(String(repeating: "─", count: 60))
+        // Warm-up: discard one pass over the first N images so Vision/Core ML
+        // initialization doesn't pollute the measurement.
+        if options.warmup > 0 {
+            let n = min(options.warmup, images.count)
+            _ = await runSinglePass(images: Array(images.prefix(n)), options: options)
+            print("🌡 Warm-up pass over \(n) image(s) discarded.")
+        }
+        if options.runs > 1 {
+            await runSingleRepeated(images: images, options: options, levelLabel: levelLabel)
+        } else {
+            await runSingleOnce(images: images, options: options, levelLabel: levelLabel)
+        }
+    }
 
+    private static func runSinglePass(images: [URL], options: RunOptions) async -> (results: [OCRItem], wall: TimeInterval) {
         let (paths, cleanup) = preparePaths(images: images, maxPixelSide: options.resizeTo)
         defer { cleanup() }
-
         let startTotal = CFAbsoluteTimeGetCurrent()
         let results: [OCRItem]
         if options.useSequential {
@@ -163,7 +178,16 @@ struct OCRBenchmark {
             applyCommonConfig(&config, options: options)
             results = await OCRService.recognizeText(paths: paths, config: config)
         }
-        let totalElapsed = CFAbsoluteTimeGetCurrent() - startTotal
+        return (results, CFAbsoluteTimeGetCurrent() - startTotal)
+    }
+
+    private static func runSingleOnce(images: [URL], options: RunOptions, levelLabel: String) async {
+        let concurrency = options.concurrency ?? (options.useSequential ? 1 : 4)
+        let modeLabel = options.useFast ? "fast + parallel" : (options.useSequential ? "accurate + sequential" : "accurate + parallel (\(concurrency))")
+        print("🔍 Running OCR on \(images.count) image(s) (\(modeLabel))…")
+        print(String(repeating: "─", count: 60))
+
+        let (results, totalElapsed) = await runSinglePass(images: images, options: options)
 
         let successful = results.filter { $0.error == nil && !$0.text.isEmpty }.count
         let failed = results.filter { $0.error != nil }.count
@@ -187,6 +211,61 @@ struct OCRBenchmark {
                                        successful: successful, failed: failed, empty: empty,
                                        p50: p50, p95: p95, p99: p99, accuracy: accuracy)
             emitJSON(json, path: options.jsonPath)
+        }
+    }
+
+    /// Repeated runs with median/min/max/stddev to separate real signal from
+    /// thermal or scheduling noise.
+    private static func runSingleRepeated(images: [URL], options: RunOptions, levelLabel: String) async {
+        let n = options.runs
+        print("🔍 Running OCR \(n)× on \(images.count) image(s) (\(levelLabel))…")
+        print(String(repeating: "─", count: 60))
+
+        var walls: [Double] = []
+        var throughputs: [Double] = []
+        var p95s: [Double] = []
+        var runsJSON: [[String: Any]] = []
+        for i in 1...n {
+            let (results, wall) = await runSinglePass(images: images, options: options)
+            let (_, p95, _) = percentiles(results.map(\.duration))
+            let t = wall > 0 ? Double(results.count) / wall : 0
+            walls.append(wall)
+            throughputs.append(t)
+            p95s.append(p95 * 1000)
+            runsJSON.append(["run": i, "wall_clock_seconds": wall, "throughput_img_s": t, "p95_latency_ms": p95 * 1000])
+        }
+
+        func stats(_ a: [Double]) -> (median: Double, min: Double, max: Double, stddev: Double) {
+            let s = a.sorted()
+            let mean = a.reduce(0, +) / Double(max(a.count, 1))
+            let variance = a.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(max(a.count, 1))
+            return (s[s.count / 2], s.first ?? 0, s.last ?? 0, variance.squareRoot())
+        }
+
+        let w = stats(walls), th = stats(throughputs), p = stats(p95s)
+        print(pad("metric", 14) + pad("median", 12) + pad("min", 12) + pad("max", 12) + "stddev")
+        print(pad("wall (s)", 14) + pad(String(format: "%.2f", w.median), 12) + pad(String(format: "%.2f", w.min), 12) + pad(String(format: "%.2f", w.max), 12) + String(format: "%.2f", w.stddev))
+        print(pad("img/s", 14) + pad(String(format: "%.1f", th.median), 12) + pad(String(format: "%.1f", th.min), 12) + pad(String(format: "%.1f", th.max), 12) + String(format: "%.1f", th.stddev))
+        print(pad("p95 (ms)", 14) + pad(String(format: "%.0f", p.median), 12) + pad(String(format: "%.0f", p.min), 12) + pad(String(format: "%.0f", p.max), 12) + String(format: "%.0f", p.stddev))
+
+        if options.outputFormat == .json {
+            let output: [String: Any] = [
+                "schema_version": "1.0",
+                "mode": "single_repeated",
+                "runs": n,
+                "environment": environmentInfo(),
+                "ocr": ocrInfo(level: levelLabel, concurrency: options.concurrency ?? 4, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
+                "median": [
+                    "wall_clock_seconds": w.median,
+                    "throughput_img_s": th.median,
+                    "p95_latency_ms": p.median,
+                    "min_wall_seconds": w.min,
+                    "max_wall_seconds": w.max,
+                    "wall_stddev_seconds": w.stddev,
+                ],
+                "passes": runsJSON,
+            ]
+            emitJSON(output, path: options.jsonPath)
         }
     }
 
@@ -343,34 +422,46 @@ struct OCRBenchmark {
         var retryReason: [String: String] = [:]
         for item in fastItems {
             guard let path = pathByKey[ownerKey(item.filename)] else { continue }
-            let lowMean = (item.meanConfidence ?? 0) < threshold
-            let catastrophic = (item.minConfidence ?? 1) < 0.4
-            let manyLow = (item.lowConfidenceRatio ?? 0) > 0.25
-            if item.text.isEmpty || lowMean || catastrophic || manyLow {
+            let decision = OCRService.shouldRetry(
+                textIsEmpty: item.text.isEmpty,
+                meanConfidence: item.meanConfidence,
+                minConfidence: item.minConfidence,
+                lowConfidenceRatio: item.lowConfidenceRatio,
+                threshold: threshold
+            )
+            if decision.retry {
                 retryPaths.insert(path)
-                if item.text.isEmpty { retryReason[item.filename] = "empty_text" }
-                else if catastrophic { retryReason[item.filename] = "min_confidence" }
-                else if manyLow { retryReason[item.filename] = "low_ratio" }
-                else { retryReason[item.filename] = "mean_confidence" }
+                retryReason[item.filename] = decision.reason ?? "confidence"
             }
         }
         let retryList = paths.filter { retryPaths.contains($0) }
 
         var accurateByFilename: [String: OCRItem] = [:]
+        var accurateItems: [OCRItem] = []
         if !retryList.isEmpty {
-            let retryResults = await OCRService.recognizeText(paths: retryList, config: accurateConfig)
-            for r in retryResults { accurateByFilename[r.filename] = r }
+            accurateItems = await OCRService.recognizeText(paths: retryList, config: accurateConfig)
+            for r in accurateItems { accurateByFilename[r.filename] = r }
         }
 
         var finalItems: [OCRItem] = []
         for item in fastItems {
             if let accurate = accurateByFilename[item.filename] {
-                finalItems.append(accurate)
+                // End-to-end per-file latency = fast probe + accurate retry.
+                finalItems.append(OCRItem(filename: accurate.filename, text: accurate.text, error: accurate.error, duration: item.duration + accurate.duration))
             } else {
                 finalItems.append(OCRItem(filename: item.filename, text: item.text, error: item.error, duration: item.duration))
             }
         }
         let wall = CFAbsoluteTimeGetCurrent() - totalStart
+
+        // Per-phase latency so adaptive p95 can be attributed to fast vs retry.
+        var stats = runStats(finalItems, wall: wall)
+        let (_, fastP95, _) = percentiles(fastItems.map(\.duration))
+        stats["fast_pass_p95_ms"] = fastP95 * 1000
+        if !accurateItems.isEmpty {
+            let (_, retryP95, _) = percentiles(accurateItems.map(\.duration))
+            stats["retry_pass_p95_ms"] = retryP95 * 1000
+        }
 
         var perFile: [[String: Any]] = []
         for item in fastItems {
@@ -392,7 +483,7 @@ struct OCRBenchmark {
         result.wall = wall
         result.retriedFiles = retryPaths.count
         result.accuracy = options.referencesDir.map { computeAccuracy(results: finalItems, referencesDir: $0) }
-        result.stats = runStats(finalItems, wall: wall)
+        result.stats = stats
         result.perFile = perFile
         return result
     }
@@ -576,51 +667,15 @@ struct OCRBenchmark {
         ]
     }
 
-    private static func baseName(_ filename: String) -> String {
-        if let range = filename.range(of: " (page ") {
-            return (String(filename[..<range.lowerBound]) as NSString).deletingPathExtension
-        }
-        return (filename as NSString).deletingPathExtension
-    }
+    private static func baseName(_ filename: String) -> String { OCRService.baseName(filename) }
 
-    private static func normalize(_ s: String) -> String {
-        s.lowercased()
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-    }
+    private static func normalize(_ s: String) -> String { OCRService.normalizeText(s) }
 
-    private static func levenshtein<Element: Equatable>(_ a: [Element], _ b: [Element]) -> Int {
-        guard !a.isEmpty else { return b.count }
-        guard !b.isEmpty else { return a.count }
-        var prev = Array(0...b.count)
-        var curr = [Int](repeating: 0, count: b.count + 1)
-        for i in 1...a.count {
-            curr[0] = i
-            for j in 1...b.count {
-                let cost = a[i - 1] == b[j - 1] ? 0 : 1
-                curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
-            }
-            swap(&prev, &curr)
-        }
-        return prev[b.count]
-    }
+    private static func levenshtein<Element: Equatable>(_ a: [Element], _ b: [Element]) -> Int { OCRService.levenshteinDistance(a, b) }
 
-    private static func cerDetail(reference: String, predicted: String) -> (rate: Double, dist: Int, refCount: Int) {
-        let r = Array(normalize(reference))
-        let p = Array(normalize(predicted))
-        guard !r.isEmpty else { return (p.isEmpty ? 0 : 1, p.count, 0) }
-        let dist = levenshtein(r, p)
-        return (Double(dist) / Double(r.count), dist, r.count)
-    }
+    private static func cerDetail(reference: String, predicted: String) -> (rate: Double, dist: Int, refCount: Int) { OCRService.cerDetail(reference: reference, predicted: predicted) }
 
-    private static func werDetail(reference: String, predicted: String) -> (rate: Double, dist: Int, refCount: Int) {
-        let r = normalize(reference).split(separator: " ").map(String.init)
-        let p = normalize(predicted).split(separator: " ").map(String.init)
-        guard !r.isEmpty else { return (p.isEmpty ? 0 : 1, p.count, 0) }
-        let dist = levenshtein(r, p)
-        return (Double(dist) / Double(r.count), dist, r.count)
-    }
+    private static func werDetail(reference: String, predicted: String) -> (rate: Double, dist: Int, refCount: Int) { OCRService.werDetail(reference: reference, predicted: predicted) }
 
     // MARK: - Environment / config metadata
 
@@ -651,7 +706,7 @@ struct OCRBenchmark {
             "concurrency": concurrencyInfo(requested: concurrency),
             "force_legacy_engine": legacyEngine,
             "engine_api": visionEngineAPI(level: level, legacyEngine: legacyEngine),
-            "vision_revision": OCRService.visionRevisionLabel(),
+            "engine_revision": visionEngineRevision(level: level, legacyEngine: legacyEngine),
         ]
     }
 
@@ -671,14 +726,31 @@ struct OCRBenchmark {
         return "RecognizeTextRequest"
     }
 
+    /// Per-engine revision so the reported revision matches the API actually
+    /// used (documents vs text requests differ on macOS 26).
+    private static func visionEngineRevision(level: String, legacyEngine: Bool) -> String {
+        if level.contains("fast") && level.contains("accurate") {
+            return "fast=\(OCRService.visionRevisionLabel()),accurate=\(accurateRevision(legacy: legacyEngine))"
+        }
+        if level == "fast" { return OCRService.visionRevisionLabel() }
+        return accurateRevision(legacy: legacyEngine)
+    }
+
+    private static func accurateRevision(legacy: Bool) -> String {
+        if #available(macOS 26.0, *), !legacy { return OCRService.documentsRevisionLabel() }
+        return OCRService.visionRevisionLabel()
+    }
+
     /// Report requested vs effective concurrency so published sweep graphs are
     /// unambiguous about how many requests actually ran concurrently.
     private static func concurrencyInfo(requested: Int) -> [String: Any] {
-        let effective = OCRService.clampedConcurrency(requested)
+        let policy = ConcurrencyPolicy.benchmark(maxConcurrent: 16)
+        let effective = OCRService.clampedConcurrency(requested, policy: policy)
         return [
             "requested_concurrency": requested,
             "effective_concurrency": effective,
-            "safety_ceiling": 16,
+            "safety_ceiling": policy.ceiling,
+            "policy": "benchmark",
             "benchmark_mode": true,
         ]
     }
@@ -733,6 +805,9 @@ struct OCRBenchmark {
         imagesPerSecond: Double, totalImages: Int, successful: Int, failed: Int, empty: Int,
         p50: Double, p95: Double, p99: Double, accuracy: AccuracySummary?
     ) -> [String: Any] {
+        let loadMs = results.compactMap(\.loadMs)
+        let visionMs = results.compactMap(\.visionMs)
+        let avg = { (a: [Double]) in a.isEmpty ? 0 : a.reduce(0, +) / Double(a.count) }
         let summary: [String: Any] = [
             "total_images": totalImages,
             "successful": successful,
@@ -745,6 +820,8 @@ struct OCRBenchmark {
             "p50_latency_ms": p50 * 1000,
             "p95_latency_ms": p95 * 1000,
             "p99_latency_ms": p99 * 1000,
+            "avg_load_ms": avg(loadMs),
+            "avg_vision_ms": avg(visionMs),
         ]
 
         var output: [String: Any] = [
@@ -759,6 +836,8 @@ struct OCRBenchmark {
                     "text": r.text,
                     "error": r.error as Any? ?? NSNull(),
                     "duration_seconds": r.duration,
+                    "load_ms": r.loadMs ?? NSNull(),
+                    "vision_ms": r.visionMs ?? NSNull(),
                 ]
             },
         ]
@@ -862,6 +941,18 @@ struct OCRBenchmark {
                     exit(1)
                 }
                 o.referencesDir = args[i + 1]; i += 1
+            case "--warmup":
+                guard i + 1 < args.count, let n = Int(args[i + 1]), n >= 0 else {
+                    print("❌ --warmup requires a non-negative integer (images to discard before measuring).")
+                    exit(1)
+                }
+                o.warmup = n; i += 1
+            case "--runs":
+                guard i + 1 < args.count, let n = Int(args[i + 1]), n >= 1 else {
+                    print("❌ --runs requires a positive integer (measurement passes).")
+                    exit(1)
+                }
+                o.runs = n; i += 1
             default:
                 if a.hasPrefix("-") {
                     print("Unknown option: \(a) (see --help)")
@@ -897,6 +988,8 @@ struct OCRBenchmark {
           --resize-to N       Downscale images to longest side N px before OCR
           --resize-sweep      Sweep resolutions 512…4096 (+native) vs CER/WER/latency/throughput
           --references DIR    Compute CER/WER/exact-match against <basename>.txt files in DIR
+          --warmup N          Discard a warm-up pass over the first N images before measuring
+          --runs N            Repeat the measurement N times and report median/min/max/stddev
           --help, -h          Show this help
 
         Modes (default: accurate + parallel):
@@ -926,6 +1019,7 @@ struct OCRBenchmark {
           swift run OCRBenchmark ~/Screenshots --lang ms-MY,en-US --json results.json
           swift run OCRBenchmark ~/Screenshots --legacy-engine --json results.json
           swift run OCRBenchmark ~/Screenshots --references ~/gt --json results.json
+          swift run OCRBenchmark ~/Screenshots --warmup 10 --runs 5 --json repeated.json
         """)
     }
 

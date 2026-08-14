@@ -10,12 +10,16 @@ public struct OCRItem: Codable, Sendable {
     public let text: String
     public let error: String?
     public let duration: TimeInterval
+    public let loadMs: Double?
+    public let visionMs: Double?
 
-    public init(filename: String, text: String, error: String?, duration: TimeInterval) {
+    public init(filename: String, text: String, error: String?, duration: TimeInterval, loadMs: Double? = nil, visionMs: Double? = nil) {
         self.filename = filename
         self.text = text
         self.error = error
         self.duration = duration
+        self.loadMs = loadMs
+        self.visionMs = visionMs
     }
 }
 
@@ -82,6 +86,10 @@ public struct OCRConfiguration: Sendable {
     /// benchmark comparisons stay on the same recognition engine across OSes.
     public var forceLegacyEngine = false
 
+    /// Minimum text height in normalized coordinates (0.0–1.0), mapped to the
+    /// document request's `minimumTextHeightFraction` when > 0.
+    public var minimumTextHeight: Float = 0.0
+
     public static let `default` = OCRConfiguration()
 
     public init(
@@ -91,7 +99,8 @@ public struct OCRConfiguration: Sendable {
         customWords: [String] = [],
         maxConcurrency: Int = 4,
         automaticallyDetectsLanguage: Bool = false,
-        forceLegacyEngine: Bool = false
+        forceLegacyEngine: Bool = false,
+        minimumTextHeight: Float = 0.0
     ) {
         self.recognitionLevel = recognitionLevel
         self.recognitionLanguages = recognitionLanguages
@@ -100,18 +109,27 @@ public struct OCRConfiguration: Sendable {
         self.maxConcurrency = maxConcurrency
         self.automaticallyDetectsLanguage = automaticallyDetectsLanguage
         self.forceLegacyEngine = forceLegacyEngine
+        self.minimumTextHeight = minimumTextHeight
     }
 }
 
 // MARK: - OCR Service
 
-public enum OCRService {
+/// How aggressively to parallelize Vision requests. The benchmark must be able
+/// to sweep beyond the production-safe ceiling to find the real optimum;
+/// production keeps a conservative cap.
+public enum ConcurrencyPolicy: Sendable {
+    case production(maxConcurrent: Int)
+    case benchmark(maxConcurrent: Int)
 
-    /// Defensive ceiling for concurrent Vision requests. Kept high (16) so the
-    /// benchmark can sweep concurrency and find the real optimum on the target
-    /// device; the app keeps its own conservative band. The "32MB ANE SRAM"
-    /// rule is an empirical safety heuristic, not an Apple hardware guarantee.
-    private static let concurrencyCeiling = 16
+    public var ceiling: Int {
+        switch self {
+        case .production(let n), .benchmark(let n): return n
+        }
+    }
+}
+
+public enum OCRService {
 
     /// Stability limit for single-file memory ingestion (MAX_FILE_SIZE_INGEST).
     static let maxIngestBytes: Int64 = 250 * 1024 * 1024
@@ -120,9 +138,11 @@ public enum OCRService {
     /// degenerate files (e.g. decompression-bomb style PDFs with huge page counts).
     static let maxPDFPages = 200
 
-    /// Clamp a requested concurrency into the safe band [1, 16].
-    public static func clampedConcurrency(_ requested: Int) -> Int {
-        min(max(requested, 1), concurrencyCeiling)
+    /// Clamp a requested concurrency into the safe band [1, ceiling] for the
+    /// given policy. The benchmark needs to sweep beyond the production-safe
+    /// ceiling to find the real optimum; production keeps a conservative cap.
+    public static func clampedConcurrency(_ requested: Int, policy: ConcurrencyPolicy = .benchmark(maxConcurrent: 16)) -> Int {
+        min(max(requested, 1), policy.ceiling)
     }
 
     /// The current Vision text-recognition request revision (underlying
@@ -130,6 +150,13 @@ public enum OCRService {
     /// so results stay comparable across macOS updates.
     public static func visionRevisionLabel() -> String {
         String(describing: RecognizeTextRequest().revision)
+    }
+
+    /// The macOS 26 document-intelligence request revision (a different engine
+    /// from `RecognizeTextRequest`), e.g. "revision1".
+    @available(macOS 26.0, *)
+    public static func documentsRevisionLabel() -> String {
+        String(describing: RecognizeDocumentsRequest().revision)
     }
 
     /// Downscale an image so its longest side is at most `maxPixelSide` pixels,
@@ -144,6 +171,83 @@ public enum OCRService {
               ] as CFDictionary)
         else { return nil }
         return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+    }
+
+    // MARK: - Pure helpers (unit-testable)
+
+    /// Lowercase + collapse whitespace, used for CER/WER comparison.
+    public static func normalizeText(_ s: String) -> String {
+        s.lowercased()
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    public static func levenshteinDistance<Element: Equatable>(_ a: [Element], _ b: [Element]) -> Int {
+        guard !a.isEmpty else { return b.count }
+        guard !b.isEmpty else { return a.count }
+        var prev = Array(0...b.count)
+        var curr = [Int](repeating: 0, count: b.count + 1)
+        for i in 1...a.count {
+            curr[0] = i
+            for j in 1...b.count {
+                let cost = a[i - 1] == b[j - 1] ? 0 : 1
+                curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+            }
+            swap(&prev, &curr)
+        }
+        return prev[b.count]
+    }
+
+    public static func cerDetail(reference: String, predicted: String) -> (rate: Double, dist: Int, refCount: Int) {
+        let r = Array(normalizeText(reference))
+        let p = Array(normalizeText(predicted))
+        guard !r.isEmpty else { return (p.isEmpty ? 0 : 1, p.count, 0) }
+        let dist = levenshteinDistance(r, p)
+        return (Double(dist) / Double(r.count), dist, r.count)
+    }
+
+    public static func werDetail(reference: String, predicted: String) -> (rate: Double, dist: Int, refCount: Int) {
+        let r = normalizeText(reference).split(separator: " ").map(String.init)
+        let p = normalizeText(predicted).split(separator: " ").map(String.init)
+        guard !r.isEmpty else { return (p.isEmpty ? 0 : 1, p.count, 0) }
+        let dist = levenshteinDistance(r, p)
+        return (Double(dist) / Double(r.count), dist, r.count)
+    }
+
+    /// Strip the "(page N)" suffix and extension from an OCR item filename.
+    public static func baseName(_ filename: String) -> String {
+        if let range = filename.range(of: " (page ") {
+            return (String(filename[..<range.lowerBound]) as NSString).deletingPathExtension
+        }
+        return (filename as NSString).deletingPathExtension
+    }
+
+    public static func percentileValue(_ values: [Double], _ p: Double) -> Double? {
+        let sorted = values.sorted()
+        guard !sorted.isEmpty else { return nil }
+        return sorted[Int((Double(sorted.count - 1) * p).rounded())]
+    }
+
+    /// Adaptive retry decision. Mean confidence alone can hide a catastrophic
+    /// block, so min/low-ratio also force a retry.
+    public static func shouldRetry(textIsEmpty: Bool, meanConfidence: Double?, minConfidence: Double?, lowConfidenceRatio: Double?, threshold: Double) -> (retry: Bool, reason: String?) {
+        if textIsEmpty { return (true, "empty_text") }
+        if let min = minConfidence, min < 0.4 { return (true, "min_confidence") }
+        if let low = lowConfidenceRatio, low > 0.25 { return (true, "low_ratio") }
+        if let mean = meanConfidence, mean < threshold { return (true, "mean_confidence") }
+        return (false, nil)
+    }
+
+    /// Convert a Vision normalized rect (bottom-left origin) to a top-left
+    /// bitmap pixel rect for cropping.
+    public static func bitmapRect(fromNormalized rect: [Double], imageWidth: Int, imageHeight: Int) -> (x: Double, y: Double, width: Double, height: Double)? {
+        guard rect.count == 4 else { return nil }
+        let x = rect[0] * Double(imageWidth)
+        let w = rect[2] * Double(imageWidth)
+        let h = rect[3] * Double(imageHeight)
+        let y = (1 - rect[1] - rect[3]) * Double(imageHeight)
+        return (x, y, w, h)
     }
 
     /// Run Vision text recognition on every image at `paths`.
@@ -289,6 +393,7 @@ public enum OCRService {
         let url = URL(fileURLWithPath: path)
         let start = CFAbsoluteTimeGetCurrent()
 
+        let loadStart = CFAbsoluteTimeGetCurrent()
         let imageData: Data
         do {
             imageData = try autoreleasepool { try Data(contentsOf: url) }
@@ -296,14 +401,17 @@ public enum OCRService {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
             return (index, OCRItem(filename: url.lastPathComponent, text: "", error: "Could not load image", duration: elapsed))
         }
+        let loadMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
 
         do {
+            let visionStart = CFAbsoluteTimeGetCurrent()
             let text = try await recognizeText(in: imageData, config: config)
+            let visionMs = (CFAbsoluteTimeGetCurrent() - visionStart) * 1000
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            return (index, OCRItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed))
+            return (index, OCRItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed, loadMs: loadMs, visionMs: visionMs))
         } catch {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            return (index, OCRItem(filename: url.lastPathComponent, text: "", error: error.localizedDescription, duration: elapsed))
+            return (index, OCRItem(filename: url.lastPathComponent, text: "", error: error.localizedDescription, duration: elapsed, loadMs: loadMs))
         }
     }
 
@@ -314,7 +422,14 @@ public enum OCRService {
     private static func recognizeText(in data: Data, config: OCRConfiguration) async throws -> String {
         if #available(macOS 26.0, *), config.recognitionLevel != .fast, !config.forceLegacyEngine {
             do {
-                let request = RecognizeDocumentsRequest()
+                var request = RecognizeDocumentsRequest()
+                var opts = request.textRecognitionOptions
+                if !config.recognitionLanguages.isEmpty { opts.recognitionLanguages = config.recognitionLanguages }
+                opts.automaticallyDetectLanguage = config.automaticallyDetectsLanguage
+                opts.useLanguageCorrection = config.usesLanguageCorrection
+                if !config.customWords.isEmpty { opts.customWords = config.customWords }
+                if config.minimumTextHeight > 0 { opts.minimumTextHeightFraction = config.minimumTextHeight }
+                request.textRecognitionOptions = opts
                 let observations = try await request.perform(on: data)
                 if let doc = observations.first?.document, !doc.text.transcript.isEmpty {
                     return reconstructDocumentText(from: doc)
@@ -463,7 +578,10 @@ public enum OCRService {
 
     /// Scale that lands in the 150–200 DPI rasterization sweet spot, capped so
     /// the longest rendered side never exceeds `maxPixelSide` (~4096px).
-    private static func renderScale(for bounds: CGRect, maxPixelSide: CGFloat = 4096) -> CGFloat {
+    /// Scale that lands in the 150–200 DPI rasterization sweet spot, capped so
+    /// the longest rendered side never exceeds `maxPixelSide` (~4096px).
+    /// PDF page bounds are in 72-pt-per-inch points.
+    public static func renderScale(for bounds: CGRect, maxPixelSide: CGFloat = 4096) -> CGFloat {
         let dpi = CGFloat(200) / 72   // 200 DPI target
         let longestSide = max(bounds.width, bounds.height)
         let scaled = longestSide * dpi

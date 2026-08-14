@@ -15,5 +15,9 @@ let package = Package(
             name: "OCRCore",
             dependencies: []
         ),
+        .testTarget(
+            name: "OCRCoreTests",
+            dependencies: ["OCRCore"]
+        ),
     ]
 )

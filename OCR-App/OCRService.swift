@@ -73,6 +73,10 @@ struct OCRConfiguration {
     /// Upscale factor applied to small-text crops before re-recognition.
     var enhanceUpscaleFactor: CGFloat = 3
 
+    /// Cap on missing-region recovery OCR calls per image. Bounds the grid-scan
+    /// cost on large images (a 4096px image has 256 cells; we OCR only the top N).
+    var maxRecoveryRegions: Int = 8
+
     static let `default` = OCRConfiguration()
 }
 
@@ -95,6 +99,11 @@ enum OCRService {
     /// Cap on pages processed per PDF, bounding CPU/ANE work on hostile or
     /// degenerate files (e.g. decompression-bomb style PDFs with huge page counts).
     static let maxPDFPages = 200
+
+    /// Cap on decoded pixels per image. Compressed bytes ≠ decoded memory (a
+    /// 10MB image can decode to hundreds of MB), so oversized images are
+    /// downscaled before Vision sees them.
+    static let maxDecodedPixels = 25_000_000
 
     /// Clamp a requested concurrency into the safe band [1, 4].
     private static func clampedConcurrency(_ requested: Int) -> Int {
@@ -167,9 +176,10 @@ enum OCRService {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
             return (index, OCRItem(filename: url.lastPathComponent, text: "", error: "Could not load image", duration: elapsed))
         }
+        let bounded = boundedImageData(imageData)
 
         do {
-            let text = try await recognizeText(in: imageData, config: config)
+            let text = try await recognizeText(in: bounded, config: config)
             let elapsed = CFAbsoluteTimeGetCurrent() - start
             return (index, OCRItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed))
         } catch {
@@ -190,7 +200,14 @@ enum OCRService {
     private static func recognizeText(in data: Data, config: OCRConfiguration) async throws -> String {
         if #available(macOS 26.0, *), config.recognitionLevel != .fast {
             do {
-                let request = RecognizeDocumentsRequest()
+                var request = RecognizeDocumentsRequest()
+                var opts = request.textRecognitionOptions
+                if !config.recognitionLanguages.isEmpty { opts.recognitionLanguages = config.recognitionLanguages }
+                opts.automaticallyDetectLanguage = config.automaticallyDetectsLanguage
+                opts.useLanguageCorrection = config.usesLanguageCorrection
+                if !config.customWords.isEmpty { opts.customWords = config.customWords }
+                if config.minimumTextHeight > 0 { opts.minimumTextHeightFraction = config.minimumTextHeight }
+                request.textRecognitionOptions = opts
                 let observations = try await request.perform(on: data)
                 if let doc = observations.first?.document, !doc.text.transcript.isEmpty {
                     return reconstructDocumentText(from: doc)
@@ -436,9 +453,10 @@ enum OCRService {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
             return (index, OCRStructuredItem(filename: url.lastPathComponent, text: "", error: "Could not load image", duration: elapsed, confidence: nil, blocks: []))
         }
+        let bounded = boundedImageData(imageData)
 
         do {
-            let result = try await recognizeStructured(in: imageData, config: config)
+            let result = try await recognizeStructured(in: bounded, config: config)
             let elapsed = CFAbsoluteTimeGetCurrent() - start
             return (index, OCRStructuredItem(filename: url.lastPathComponent, text: result.text, error: nil, duration: elapsed, confidence: result.confidence, blocks: result.blocks))
         } catch {
@@ -551,12 +569,12 @@ enum OCRService {
         return NSBitmapImageRep(cgImage: scaled).representation(using: .png, properties: [:])
     }
 
-    /// Scan a grid of cells for text-like regions that no block covers, and
-    /// OCR them after cropping + upscaling. Returns recovered blocks in
-    /// global normalized coordinates.
+    /// Scan a grid of cells for text-like regions that no block covers, rank
+    /// them by text-likeness, OCR only the top `maxRecoveryRegions`, and return
+    /// accepted blocks in global normalized coordinates.
     private static func recoverSuspiciousRegions(image: CGImage, imageW: CGFloat, imageH: CGFloat, blocks: [OCRBlock], config: OCRConfiguration, baseConfig: OCRConfiguration) async -> [OCRBlock] {
         let cellSize: CGFloat = 256
-        var recovered: [OCRBlock] = []
+        var candidates: [(rect: CGRect, ratio: Double)] = []
         let cols = Int(ceil(imageW / cellSize))
         let rows = Int(ceil(imageH / cellSize))
 
@@ -569,27 +587,37 @@ enum OCRService {
 
                 let ratio = darkPixelRatio(image, in: cellRect)
                 guard ratio >= 0.03, ratio <= 0.6 else { continue }   // blank or solid-fill
+                candidates.append((cellRect, ratio))
+            }
+        }
 
-                let padded = cellRect.insetBy(dx: -16, dy: -16).intersection(CGRect(x: 0, y: 0, width: imageW, height: imageH))
-                guard let crop = image.cropping(to: padded),
-                      let png = upscalePNG(crop, factor: config.enhanceUpscaleFactor)
-                else { continue }
+        // Rank by text-likeness (closest to a typical text dark ratio ~0.2),
+        // then bound the number of actual OCR calls.
+        let ranked = candidates.sorted { abs($0.ratio - 0.2) < abs($1.ratio - 0.2) }
+        var recovered: [OCRBlock] = []
+        for (cellRect, _) in ranked.prefix(max(config.maxRecoveryRegions, 1)) {
+            let padded = cellRect.insetBy(dx: -16, dy: -16).intersection(CGRect(x: 0, y: 0, width: imageW, height: imageH))
+            guard let crop = image.cropping(to: padded),
+                  let png = upscalePNG(crop, factor: config.enhanceUpscaleFactor)
+            else { continue }
 
-                let core: (text: String, confidence: Double?, blocks: [OCRBlock])
-                do {
-                    core = try await recognizeStructuredCore(in: png, config: baseConfig)
-                } catch { continue }
-                guard !core.text.isEmpty, !core.blocks.isEmpty else { continue }
+            let core: (text: String, confidence: Double?, blocks: [OCRBlock])
+            do {
+                core = try await recognizeStructuredCore(in: png, config: baseConfig)
+            } catch { continue }
+            // Acceptance gate: don't insert hallucinated/low-confidence text.
+            guard !core.text.isEmpty, !core.blocks.isEmpty,
+                  let conf = core.confidence, conf >= 0.5
+            else { continue }
 
-                // Map crop-local normalized blocks (bottom-left origin) back to
-                // global normalized coordinates.
-                for local in core.blocks where local.rect.count == 4 {
-                    let nX = (padded.origin.x + CGFloat(local.rect[0]) * padded.width) / imageW
-                    let nY = (padded.origin.y + CGFloat(local.rect[1]) * padded.height) / imageH
-                    let nW = CGFloat(local.rect[2]) * padded.width / imageW
-                    let nH = CGFloat(local.rect[3]) * padded.height / imageH
-                    recovered.append(OCRBlock(text: local.text, confidence: local.confidence, rect: [Double(nX), Double(nY), Double(nW), Double(nH)]))
-                }
+            // Map crop-local normalized blocks (bottom-left origin) back to
+            // global normalized coordinates.
+            for local in core.blocks where local.rect.count == 4 {
+                let nX = (padded.origin.x + CGFloat(local.rect[0]) * padded.width) / imageW
+                let nY = (padded.origin.y + CGFloat(local.rect[1]) * padded.height) / imageH
+                let nW = CGFloat(local.rect[2]) * padded.width / imageW
+                let nH = CGFloat(local.rect[3]) * padded.height / imageH
+                recovered.append(OCRBlock(text: local.text, confidence: local.confidence, rect: [Double(nX), Double(nY), Double(nW), Double(nH)]))
             }
         }
         return recovered
@@ -705,6 +733,26 @@ enum OCRService {
         }
 
         return items
+    }
+
+    /// Downscale an image whose decoded pixel count exceeds the budget before
+    /// Vision decodes it, bounding memory on huge/hostile uploads.
+    private static func boundedImageData(_ data: Data) -> Data {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int,
+              w > 0, h > 0, w * h > maxDecodedPixels
+        else { return data }
+        let maxSide = Int(sqrt(Double(maxDecodedPixels)))
+        guard let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxSide,
+        ] as CFDictionary),
+        let png = NSBitmapImageRep(cgImage: thumb).representation(using: .png, properties: [:])
+        else { return data }
+        return png
     }
 
     // MARK: - File Helpers
