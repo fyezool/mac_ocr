@@ -184,16 +184,20 @@ Repeated runs with stats:
 │   ├── ServerTabView.swift      # Server tab UI
 │   ├── ServerViewModel.swift    # Server state
 │   ├── HistoryTabView.swift     # History tab
-│   ├── ServerManager.swift      # Embedded HTTP server (BSD sockets + GCD)
-│   └── OCRService.swift         # Vision OCR + PDF rendering + ANE tuning
+│   └── ServerManager.swift      # Embedded HTTP server (BSD sockets + GCD)
 ├── OCR-App.xcodeproj/           # Xcode project
 ├── OCRBenchmark/                # CLI benchmark tool (Swift Package)
+│   └── Sources/OCRCore/OCRService.swift  # SHARED OCR implementation
+│                                       (compiled into the app and benchmark)
 ├── docs/
 │   └── ANE_ENGINEERING_RULESET.md  # ANE/Vision constraints for agents
 ├── API.md                       # HTTP API documentation
 └── tools/
     └── batch_benchmark.sh       # Multi-run benchmark wrapper
 ```
+
+> **Note:** the GUI, the HTTP server, and the benchmark all compile the **same**
+> `OCRCore/OCRService.swift` — what you benchmark is what you deploy.
 
 ## Requirements
 
