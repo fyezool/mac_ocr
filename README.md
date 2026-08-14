@@ -12,8 +12,9 @@ Engine (ANE). Built-in LAN HTTP server for OCR automation on the local network.
 - **macOS 26 Document Intelligence** — Uses `RecognizeDocumentsRequest` where
   available for native paragraph / table / list structure; falls back to
   bounding-box reconstruction on older systems
-- **Parallel processing** — Up to 4 concurrent Vision requests on the ANE
-  (`clampedConcurrency` keeps the working set under the 32MB SRAM budget)
+- **Parallel processing** — Bounded concurrency (up to 4 requests in the app by
+  default) via `clampedConcurrency`; the bound reflects an empirically observed
+  working-set performance cliff, not a documented Apple hardware limit
 - **Live timer** — Elapsed time shown during processing
 - **File dropdown** — Browse per-file results via dropdown on native and web UI
 - **Copy & Save** — Copy individual file text, copy all, save all as `.txt`
@@ -131,8 +132,9 @@ swift run -c release OCRBenchmark ~/Screenshots --sweep --json sweep.json
 # Resolution sweep 512…4096 (+native) vs CER/WER/latency/throughput
 swift run -c release OCRBenchmark ~/Screenshots --resize-sweep --references ~/gt --json resize.json
 
-# Adaptive cascade: fast probe → retry accurate on low-confidence items,
-# benchmarked against always-accurate (throughput, p95, CER/WER)
+# Adaptive cascade: fast probe → retry accurate on low-confidence items.
+# Routing uses mean/min/p10/low-ratio confidence, not just the mean.
+# Benchmarked against always-accurate (throughput, p95, CER/WER).
 swift run -c release OCRBenchmark ~/Screenshots --adaptive --json adaptive.json
 
 # Sweep the adaptive threshold (0.50–0.95) to find the accuracy/latency frontier
@@ -146,20 +148,24 @@ swift run -c release OCRBenchmark ~/Screenshots --resize-to 1024 --json results.
 # Accuracy: CER/WER/exact-match against <basename>.txt ground truth
 swift run -c release OCRBenchmark ~/Screenshots --references ~/gt --json results.json
 
-# JSON output (also records OS, SoC, RAM, Vision revision, p50/p95/p99)
+# JSON output (also records OS, SoC, RAM, Vision revision, engine API, p50/p95/p99)
 swift run -c release OCRBenchmark ~/Screenshots --json results.json
 ```
 
-Benchmark JSON now records the environment (OS, device model, SoC, RAM), the OCR
-configuration (recognition level, languages, concurrency with requested vs
-effective values and safety ceiling, Vision revision, engine pinning), per-file
-latency percentiles (p50/p95/p99), and — with `--references` — both **macro**
+Benchmark JSON records the environment (OS, device model, SoC, RAM), the OCR
+configuration (recognition level, languages, requested vs effective concurrency
+with the safety ceiling, Vision revision, engine pinning), the Vision request
+type actually used (`engine_api` — e.g. `RecognizeTextRequest` vs macOS 26's
+`RecognizeDocumentsRequest`, which differ on the accurate path), and per-file
+latency percentiles (p50/p95/p99). With `--references` it reports both **macro**
 and **micro** (corpus-level) CER/WER plus exact match. `--sweep`,
 `--resize-sweep`, and `--adaptive-sweep` expose concurrency, input resolution,
 and the adaptive retry threshold as measured dimensions instead of assuming the
 hard-coded defaults are optimal. `--legacy-engine` forces the
 `RecognizeTextRequest` path even on macOS 26 so engine-dependent comparisons
-stay apples-to-apples.
+stay apples-to-apples. The adaptive output records per-file `engine_used`
+(`fast` vs `fast+accurate`) and `retry_reason` (empty/mean/min/low-ratio), so
+you can learn which images genuinely need the expensive accurate pass.
 
 Repeated runs with stats:
 ```bash
@@ -211,6 +217,7 @@ on-device OCR:
 - **S3** (practitioner report): Vision OCR achieves ~99% perceived accuracy.
 - **S4** (MLX batch scaling, arXiv 2510.18921): Apple Silicon shows sub-linear
   latency scaling with batch size, motivating parallel processing.
-- **ANE ruleset**: 32MB SRAM working-set budget, 2–4 concurrency band,
-  200 DPI PDF rendering, 250MB ingest limit — implemented and documented in
+- **ANE ruleset**: empirically observed ~32MB-class working-set performance
+  cliff (app keeps a conservative 2–4 concurrency band), 200 DPI PDF rendering,
+  250MB ingest limit — implemented and documented in
   `docs/ANE_ENGINEERING_RULESET.md`.
