@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		C001000003 /* OCRService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000020 /* OCRService.swift */; };
+		C001000022 /* ServerSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000021 /* ServerSupport.swift */; };
 		C001000016 /* ServerManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C001000017 /* ServerManager.swift */; };
 		C002000010 /* OCR_App.swift in Sources */ = {isa = PBXBuildFile; fileRef = C002000000 /* OCR_App.swift */; };
 		C002000011 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C002000001 /* ContentView.swift */; };
@@ -22,6 +23,7 @@
 		C001000004 /* OCR App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "OCR App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		C001000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		C001000020 /* OCRService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "OCRBenchmark/Sources/OCRCore/OCRService.swift"; sourceTree = "<group>"; };
+		C001000021 /* ServerSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "OCRBenchmark/Sources/OCRCore/ServerSupport.swift"; sourceTree = "<group>"; };
 		C001000017 /* ServerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerManager.swift; sourceTree = "<group>"; };
 		C001000019 /* ServerViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerViewController.swift; sourceTree = "<group>"; };
 		C002000000 /* OCR_App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OCR_App.swift; sourceTree = "<group>"; };
@@ -49,6 +51,7 @@
 			children = (
 				C00100000B /* OCR-App */,
 				C001000020 /* OCRService.swift */,
+				C001000021 /* ServerSupport.swift */,
 				C00100000C /* Products */,
 			);
 			sourceTree = "<group>";
@@ -130,6 +133,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				C001000003 /* OCRService.swift in Sources */,
+				C001000022 /* ServerSupport.swift in Sources */,
 				C001000016 /* ServerManager.swift in Sources */,
 				C002000010 /* OCR_App.swift in Sources */,
 				C002000011 /* ContentView.swift in Sources */,
