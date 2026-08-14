@@ -1,0 +1,3 @@
+Minimum viable text size on a phone screen.
+Twelve point type is still legible to the ANE.
+Small text stresses the recovery pipeline.

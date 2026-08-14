@@ -1,0 +1,6 @@
+The corpus exists to make OCR results comparable across operating systems and chips.
+Every machine runs the same images and the same reference transcripts, so a
+difference in CER or latency can be attributed to the hardware or the Vision
+revision rather than to a different test set.
+The generator renders each image from its own ground-truth string, so the
+reference text is exact by construction and the whole set is reproducible.

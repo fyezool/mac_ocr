@@ -207,6 +207,35 @@ Repeated runs with stats:
 > `ServerManager`, both unit-testable; `Tests/OCRCoreTests` even spins up a live
 > server and drives it over real HTTP requests.
 
+## Cross-OS / Cross-Chip Benchmark Corpus
+
+`corpus/` is a fixed, versioned set of images + golden transcripts for comparing
+OCR accuracy and latency **across macOS versions and Apple Silicon chips**. The
+ground truth is generated from the same string that renders each image, so CER is
+exact by construction and the set is reproducible on any host.
+
+```bash
+# 1. (re)generate the corpus — images, references, manifest.json (corpus_version)
+swift tools/gen_corpus.swift
+
+# 2. run all modes on THIS machine (legacy RecognizeTextRequest = the engine
+#    available on every macOS, so numbers stay comparable across OS versions)
+BENCH_RUNS=3 tools/cross_bench.sh
+
+# 3. after running #2 on each machine you care about, merge them:
+python3 tools/cross_compare.py          # prints table + writes corpus/results/comparison.md
+```
+
+- 12 samples: printed paragraph, monospaced receipt, small text, two-column,
+  rotated, cursive, Malay, low-res, noisy, dense numbers, long document, one-page
+  PDF.
+- The runner fixes `--concurrency 4` and tags each result JSON by
+  hostname/model/macOS, e.g. `legacy_accurate_mbp_Mac14-2_macos15.json`.
+- `CORPUS_NATIVE=1` additionally runs the macOS 26 documents engine
+  (`RecognizeDocumentsRequest`) as a machine-local signal; the legacy pass
+  remains the cross-OS baseline.
+- Per-machine result JSONs live under `corpus/results/` and are gitignored.
+
 ## Requirements
 
 - macOS 15+ (macOS 26 recommended for Document Intelligence)

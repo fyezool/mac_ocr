@@ -1,0 +1,4 @@
+The quick brown fox jumps over the lazy dog. This sentence contains every letter of the English alphabet and is a classic test of type rendering.
+Although short, the pangram exercises ascenders, descenders, and the fine strokes of a font.
+For OCR benchmarking, a known reference string makes character error rates exact and reproducible across machines and operating systems.
+The neural engine processes each image in parallel, bounded by a global concurrency gate so the chip is never oversubscribed.

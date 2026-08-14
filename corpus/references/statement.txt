@@ -1,0 +1,7 @@
+Monthly Statement of Account
+Account number: 1234-5678-9012
+Opening balance: RM 2,150.00
+Payments received: RM 800.00
+Interest: RM 12.30
+Closing balance: RM 1,362.30
+This statement was generated for benchmarking purposes.

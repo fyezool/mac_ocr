@@ -1,0 +1,2 @@
+Large type rendered at low resolution.
+The enhancement path upscales before re-recognising.

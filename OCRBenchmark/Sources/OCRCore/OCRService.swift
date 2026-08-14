@@ -444,11 +444,12 @@ public enum OCRService {
 
     /// Sequential version — processes one file at a time. Useful as a
     /// baseline for benchmarking the speedup from parallel processing.
-    public static func recognizeTextSequential(paths: [String], fast: Bool = false) async -> [OCRItem] {
-        let config = fast ? { var c = OCRConfiguration.default; c.recognitionLevel = .fast; return c }() : .default
+    public static func recognizeTextSequential(paths: [String], fast: Bool = false, config: OCRConfiguration = .default) async -> [OCRItem] {
+        var cfg = config
+        if fast { cfg.recognitionLevel = .fast }
         var results: [OCRItem] = []
         for (i, path) in paths.enumerated() {
-            let (_, items) = await processPath(path, index: i, config: config)
+            let (_, items) = await processPath(path, index: i, config: cfg)
             results.append(contentsOf: items)
         }
         return results

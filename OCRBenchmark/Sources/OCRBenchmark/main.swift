@@ -24,6 +24,7 @@ struct OCRBenchmark {
         var resizeTo: Int?
         var resizeSweep = false
         var referencesDir: String?
+        var corpusVersion: String?
         var warmup = 0
         var runs = 1
         var help = false
@@ -173,13 +174,13 @@ struct OCRBenchmark {
         let (paths, cleanup) = preparePaths(images: images, maxPixelSide: options.resizeTo)
         defer { cleanup() }
         let startTotal = CFAbsoluteTimeGetCurrent()
+        var config = OCRConfiguration.default
+        if options.useFast { config.recognitionLevel = .fast }
+        applyCommonConfig(&config, options: options)
         let results: [OCRItem]
         if options.useSequential {
-            results = await OCRService.recognizeTextSequential(paths: paths, fast: options.useFast)
+            results = await OCRService.recognizeTextSequential(paths: paths, config: config)
         } else {
-            var config = OCRConfiguration.default
-            if options.useFast { config.recognitionLevel = .fast }
-            applyCommonConfig(&config, options: options)
             results = await OCRService.recognizeText(paths: paths, config: config)
         }
         return (results, CFAbsoluteTimeGetCurrent() - startTotal)
@@ -255,6 +256,7 @@ struct OCRBenchmark {
         if options.outputFormat == .json {
             let output: [String: Any] = [
                 "schema_version": "1.0",
+                "corpus_version": options.corpusVersion ?? "",
                 "mode": "single_repeated",
                 "runs": n,
                 "environment": environmentInfo(),
@@ -321,6 +323,7 @@ struct OCRBenchmark {
         if options.outputFormat == .json {
             let output: [String: Any] = [
                 "schema_version": "1.0",
+                "corpus_version": options.corpusVersion ?? "",
                 "mode": "sweep",
                 "environment": environmentInfo(),
                 "ocr": ocrInfo(level: levelLabel, concurrency: 0, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
@@ -388,6 +391,7 @@ struct OCRBenchmark {
             if let accuracyBaseline { baseline["accuracy"] = accuracyJSON(accuracyBaseline) }
             let output: [String: Any] = [
                 "schema_version": "1.0",
+                "corpus_version": options.corpusVersion ?? "",
                 "mode": "adaptive",
                 "environment": environmentInfo(),
                 "ocr": ocrInfo(level: "fast+accurate", concurrency: concurrency, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
@@ -537,6 +541,7 @@ struct OCRBenchmark {
         if options.outputFormat == .json {
             let output: [String: Any] = [
                 "schema_version": "1.0",
+                "corpus_version": options.corpusVersion ?? "",
                 "mode": "adaptive_sweep",
                 "environment": environmentInfo(),
                 "ocr": ocrInfo(level: "fast+accurate", concurrency: concurrency, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
@@ -621,6 +626,7 @@ struct OCRBenchmark {
         if options.outputFormat == .json {
             let output: [String: Any] = [
                 "schema_version": "1.0",
+                "corpus_version": options.corpusVersion ?? "",
                 "mode": "resize_sweep",
                 "environment": environmentInfo(),
                 "ocr": ocrInfo(level: "accurate", concurrency: options.concurrency ?? 4, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
@@ -831,6 +837,7 @@ struct OCRBenchmark {
 
         var output: [String: Any] = [
             "schema_version": "1.0",
+            "corpus_version": options.corpusVersion ?? "",
             "mode": "single",
             "environment": environmentInfo(),
             "ocr": ocrInfo(level: levelLabel, concurrency: concurrency, autoLang: options.useAutoLang, languages: options.languages ?? ["en-US"], legacyEngine: options.legacyEngine),
@@ -946,6 +953,12 @@ struct OCRBenchmark {
                     exit(1)
                 }
                 o.referencesDir = args[i + 1]; i += 1
+            case "--corpus-version":
+                guard i + 1 < args.count, !args[i + 1].hasPrefix("-") else {
+                    print("❌ --corpus-version requires a version string.")
+                    exit(1)
+                }
+                o.corpusVersion = args[i + 1]; i += 1
             case "--warmup":
                 guard i + 1 < args.count, let n = Int(args[i + 1]), n >= 0 else {
                     print("❌ --warmup requires a non-negative integer (images to discard before measuring).")
@@ -993,6 +1006,7 @@ struct OCRBenchmark {
           --resize-to N       Downscale images to longest side N px before OCR
           --resize-sweep      Sweep resolutions 512…4096 (+native) vs CER/WER/latency/throughput
           --references DIR    Compute CER/WER/exact-match against <basename>.txt files in DIR
+          --corpus-version V  Tag the report with the benchmark-corpus version (e.g. 1.0)
           --warmup N          Discard a warm-up pass over the first N images before measuring
           --runs N            Repeat the measurement N times and report median/min/max/stddev
           --help, -h          Show this help

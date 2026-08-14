@@ -1,0 +1,2 @@
+A quick brown fox jumps over the lazy dog
+written in a cursive hand for handwriting-like OCR.

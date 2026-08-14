@@ -40,3 +40,6 @@ reasonix.toml
 # Runtime databases
 *.sqlite3
 *.sqlite3-*
+
+# Cross-machine benchmark corpus runs (not committed)
+corpus/results/

@@ -1,0 +1,2 @@
+Text on a lightly textured background.
+Salt and pepper noise should not hide the words.

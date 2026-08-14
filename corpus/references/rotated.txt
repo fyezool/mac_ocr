@@ -1,0 +1,2 @@
+This line is rotated three degrees about the image centre.
+Detection must still locate and read it correctly.

@@ -1,0 +1,6 @@
+Column one: the first paragraph about layout.
+Columns are read left to right by humans.
+This sample stresses structural fidelity.
+Column two: the second paragraph.
+Vision may reorder columns across engines.
+Compare this row across machines, not in isolation.

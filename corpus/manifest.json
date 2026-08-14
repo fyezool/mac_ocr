@@ -1,0 +1,104 @@
+{
+  "corpus_version" : "1.0",
+  "files" : [
+    {
+      "filename" : "printed.png",
+      "id" : "printed",
+      "language" : "en-US",
+      "layout" : "paragraph",
+      "notes" : "Plain printed English paragraph, standard size",
+      "reference" : "printed.txt"
+    },
+    {
+      "filename" : "receipt.png",
+      "id" : "receipt",
+      "language" : "en-MS",
+      "layout" : "table",
+      "notes" : "Monospaced receipt, dense digits and currency",
+      "reference" : "receipt.txt"
+    },
+    {
+      "filename" : "small_text.png",
+      "id" : "small_text",
+      "language" : "en-US",
+      "layout" : "small-text",
+      "notes" : "Small font, tests enhanceSmallText",
+      "reference" : "small_text.txt"
+    },
+    {
+      "filename" : "multicolumn.png",
+      "id" : "multicolumn",
+      "language" : "en-US",
+      "layout" : "multicolumn",
+      "notes" : "Order-sensitive: measures layout reconstruction, compare relative across machines",
+      "reference" : "multicolumn.txt"
+    },
+    {
+      "filename" : "rotated.png",
+      "id" : "rotated",
+      "language" : "en-US",
+      "layout" : "rotated",
+      "notes" : "~3 degree rotation",
+      "reference" : "rotated.txt"
+    },
+    {
+      "filename" : "cursive.png",
+      "id" : "cursive",
+      "language" : "en-US",
+      "layout" : "cursive",
+      "notes" : "Cursive script font, handwriting-like",
+      "reference" : "cursive.txt"
+    },
+    {
+      "filename" : "malay.png",
+      "id" : "malay",
+      "language" : "ms-MY",
+      "layout" : "paragraph",
+      "notes" : "Malay-language paragraph (Latin script)",
+      "reference" : "malay.txt"
+    },
+    {
+      "filename" : "lowres.png",
+      "id" : "lowres",
+      "language" : "en-US",
+      "layout" : "lowres",
+      "notes" : "Downsampled 2x — stresses upscaling\/recovery",
+      "reference" : "lowres.txt"
+    },
+    {
+      "filename" : "noisy.png",
+      "id" : "noisy",
+      "language" : "en-US",
+      "layout" : "noisy",
+      "notes" : "Seeded salt-and-pepper noise + faint bands",
+      "reference" : "noisy.txt"
+    },
+    {
+      "filename" : "numbers.png",
+      "id" : "numbers",
+      "language" : "en-US",
+      "layout" : "numeric",
+      "notes" : "Dense currency figures, digit accuracy",
+      "reference" : "numbers.txt"
+    },
+    {
+      "filename" : "long_doc.png",
+      "id" : "long_doc",
+      "language" : "en-US",
+      "layout" : "paragraph",
+      "notes" : "Longer text — larger CER sample",
+      "reference" : "long_doc.txt"
+    },
+    {
+      "filename" : "statement.pdf",
+      "id" : "statement",
+      "language" : "en-US",
+      "layout" : "pdf",
+      "notes" : "Single-page PDF — exercises the (page N) path",
+      "reference" : "statement.txt"
+    }
+  ],
+  "generated_at" : "2026-08-14T15:31:14Z",
+  "generator" : "tools\/gen_corpus.swift",
+  "schema_version" : "1.0"
+}

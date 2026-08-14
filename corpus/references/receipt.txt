@@ -1,0 +1,14 @@
+WARUNG SEDAP SDN BHD
+No. 12 Jalan Ampang, Kuala Lumpur
+Tel: 03-1234 5678
+----------------------------------------
+Item              Qty      Amount
+Nasi Lemak         2      RM 12.00
+Mee Goreng         1       RM 8.50
+Teh Tarik          2       RM 4.00
+Kopi O             1       RM 2.50
+Roti Canai         2       RM 5.00
+----------------------------------------
+SUBTOTAL                   RM 32.00
+SST 6%                     RM 1.92
+TOTAL                      RM 33.92
