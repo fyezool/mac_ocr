@@ -1,7 +1,8 @@
 # OCR Server API
 
 The OCR App includes an in-process HTTP server that exposes OCR functionality
-over the local network. All endpoints run on `http://<server-ip>:8080`.
+on the detected private LAN address at `http://<server-ip>:8080`. It is intended
+for local-network use only.
 
 ---
 
@@ -39,6 +40,7 @@ Content-Type: text/html; charset=utf-8
 Returns a full HTML page with:
 - File drop zone (tap to select, drag & drop)
 - Supported formats: PNG, JPG, GIF, BMP, TIFF, HEIC, WebP
+- Camera capture (shown only over HTTPS — e.g. via the reverse proxy)
 - Run OCR button
 - Live elapsed timer during processing
 - Selected file count with unsupported format warning
@@ -114,25 +116,25 @@ Content-Type: application/json
 
 ```bash
 # HTML results page (default)
-curl -X POST -F "image=@shot.png" http://192.168.2.6:8080/ocr
+  curl -X POST -F "image=@shot.png" http://<server-ip>:8080/ocr
 
 # Plain text output
-curl -X POST -F "image=@shot.png" http://192.168.2.6:8080/ocr?format=txt
+  curl -X POST -F "image=@shot.png" http://<server-ip>:8080/ocr?format=txt
 
 # JSON output (great for scripting)
-curl -X POST -F "image=@shot.png" http://192.168.2.6:8080/ocr?format=json
+  curl -X POST -F "image=@shot.png" http://<server-ip>:8080/ocr?format=json
 
 # Multiple files as JSON
 curl -X POST \
   -F "image=@photo1.png" \
   -F "image=@photo2.jpg" \
-  "http://192.168.2.6:8080/ocr?format=json"
+  "http://<server-ip>:8080/ocr?format=json"
 
 # Fast mode (~2-3x faster, good for bulk processing)
-curl -X POST -F "image=@shot.png" "http://192.168.2.6:8080/ocr?fast=1"
+curl -X POST -F "image=@shot.png" "http://<server-ip>:8080/ocr?fast=1"
 
 # Fast mode + JSON output (for scripting)
-curl -X POST -F "image=@shot.png" "http://192.168.2.6:8080/ocr?fast=1&format=json"
+curl -X POST -F "image=@shot.png" "http://<server-ip>:8080/ocr?fast=1&format=json"
 ```
 
 ### Example (Python)
@@ -140,7 +142,7 @@ curl -X POST -F "image=@shot.png" "http://192.168.2.6:8080/ocr?fast=1&format=jso
 ```python
 import requests
 
-url = "http://192.168.2.6:8080/ocr"
+url = "http://<server-ip>:8080/ocr"
 files = [
     ("image", ("shot1.png", open("shot1.png", "rb"), "image/png")),
     ("image", ("shot2.jpg", open("shot2.jpg", "rb"), "image/jpeg")),
@@ -162,7 +164,7 @@ for result in data["results"]:
 ```swift
 import Foundation
 
-let url = URL(string: "http://192.168.2.6:8080/ocr")!
+let url = URL(string: "http://<server-ip>:8080/ocr")!
 var req = URLRequest(url: url)
 req.httpMethod = "POST"
 

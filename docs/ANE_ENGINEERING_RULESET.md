@@ -26,7 +26,7 @@
 | **Amortize the ~2.3ms Core ML dispatch floor** | Every XPC round-trip costs ≥2.3ms | ✅ We send full pages/images per request, never tiny slices |
 | **Bound concurrency (2–4 requests)** | ANE has 16 cores but the combined IOSurface working set can exceed SRAM → cliff + Jetsam | ✅ `clampedConcurrency(_:)` clamps to [1, 4]; `maxConcurrency` default 4 |
 | **Prefer `.accurate` for quality** | `RecognizeTextRequest` accurate path is ANE-backed and near-99% (practitioner evidence) | ✅ default is `.accurate`; `.fast` exists but is user-authorized (explicit opt-in in UI/web/benchmark) |
-| **250MB ingest stability limit** | Giant files OOM the process / trigger Jetsam on high-volume ingestion | ✅ `OCRService.maxIngestBytes` = 250MB; enforced in `collectImages`, `addURLs`, and web `POST /ocr` (HTTP 413) |
+| **Server ingest limits** | Giant requests OOM the process / trigger Jetsam on high-volume ingestion | ✅ Server `POST /ocr` is capped at 64MB total, 16MB per file, and 16 files; local ingestion remains capped at 250MB |
 
 ## 3. macOS 26 Document Intelligence (use when available)
 

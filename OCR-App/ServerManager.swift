@@ -37,6 +37,8 @@ final class ServerManager: NSObject, @unchecked Sendable {
     var isRunning: Bool { running }
     var port: UInt16 = 8080
     private(set) var address: String = "127.0.0.1"
+    private let connectionLimit = DispatchSemaphore(value: 16)
+    private let ocrLimit = DispatchSemaphore(value: 2)
     var urlString: String { "http://\(address):\(port)" }
     var recentLog: [ServerLogEntry] {
         logLock.lock(); defer { logLock.unlock() }
@@ -92,7 +94,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         self.address = localAddress() ?? "127.0.0.1"
         sockfd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard sockfd >= 0 else { notifyStatus(error: "socket() failed"); return }
-        var flags = fcntl(sockfd, F_GETFL, 0)
+        let flags = fcntl(sockfd, F_GETFL, 0)
         guard flags >= 0 else { Darwin.close(sockfd); sockfd = -1; notifyStatus(error: "fcntl F_GETFL failed"); return }
         guard fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) >= 0 else { Darwin.close(sockfd); sockfd = -1; notifyStatus(error: "fcntl F_SETFL failed"); return }
         var reuse: Int32 = 1
@@ -100,7 +102,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = CFSwapInt16HostToBig(port)
-        addr.sin_addr.s_addr = INADDR_ANY
+        addr.sin_addr.s_addr = inet_addr(self.address)
         let r = withUnsafePointer(to: &addr) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sockfd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }
         guard r == 0 else { Darwin.close(sockfd); sockfd = -1; notifyStatus(error: "bind() failed (port \(port) may be in use)"); return }
         guard Darwin.listen(sockfd, 5) == 0 else { Darwin.close(sockfd); sockfd = -1; notifyStatus(error: "listen() failed"); return }
@@ -110,11 +112,21 @@ final class ServerManager: NSObject, @unchecked Sendable {
             var ca = sockaddr_in(); var cl = socklen_t(MemoryLayout<sockaddr_in>.size)
             let cf = withUnsafeMutablePointer(to: &ca) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.accept(fd, $0, &cl) } }
             guard cf >= 0 else { if errno == EAGAIN || errno == EWOULDBLOCK { break }; break }
-            var fl = fcntl(cf, F_GETFL, 0); fcntl(cf, F_SETFL, fl | O_NONBLOCK)
-            let ip = String(cString: inet_ntoa(ca.sin_addr))
             guard let srv = self else { Darwin.close(cf); break }
+            guard srv.connectionLimit.wait(timeout: .now()) == .success else {
+                srv.sendAndClose(cf, 503, "Too many connections", "text/plain")
+                continue
+            }
+            var noSigPipe: Int32 = 1
+            setsockopt(cf, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+            let fl = fcntl(cf, F_GETFL, 0); _ = fcntl(cf, F_SETFL, fl | O_NONBLOCK)
+            let ip = String(cString: inet_ntoa(ca.sin_addr))
             srv.trackClient(cf, ip: ip)
-            srv.queue.async { srv.handle(cf, ip: ip); srv.untrackClient(cf) }
+            srv.queue.async {
+                defer { srv.connectionLimit.signal() }
+                srv.handle(cf, ip: ip)
+                srv.untrackClient(cf)
+            }
         } }
         source?.setCancelHandler { Darwin.close(fd) }
         source?.resume()
@@ -130,14 +142,17 @@ final class ServerManager: NSObject, @unchecked Sendable {
         var attempts = 0
         var hdrEndPos = -1
         var contentLength = -1
-        // Hard ceiling on total request size (headers + multipart body). Prevents
-        // unbounded memory growth from a client that streams data forever.
-        let maxRequestBytes = 1_000_000_000  // 1GB safety cap
+        let maxHeaderBytes = 32 * 1024
+        let maxRequestBytes = 64 * 1024 * 1024
         var tooLarge = false
+        var timedOut = false
+        let deadline = Date().addingTimeInterval(30)
         while attempts < 100 {
+            if Date() >= deadline { timedOut = true; break }
             let n = read(fd, &tmp, tmp.count)
             if n > 0 {
                 buf.append(tmp, count: n); attempts = 0
+                if hdrEndPos < 0, buf.count > maxHeaderBytes { tooLarge = true; break }
                 if buf.count > maxRequestBytes { tooLarge = true; break }
             }
             else if n == 0 { break }
@@ -160,15 +175,10 @@ final class ServerManager: NSObject, @unchecked Sendable {
             if hdrEndPos >= 0, contentLength < 0 { break }
         }
         guard buf.count > 0 else { Darwin.close(fd); return }
+        if timedOut { sendAndClose(fd, 408, "Request timeout", "text/plain"); return }
         if tooLarge { sendAndClose(fd, 413, "Request too large", "text/plain"); return }
         let start = CFAbsoluteTimeGetCurrent()
         guard let req = Req(buf) else { sendAndClose(fd, 400, "Bad Request", "text/plain"); return }
-        // Host-header check: mitigate DNS rebinding. Require a Host header that
-        // is localhost, 127.0.0.1, or the machine's own detected LAN address.
-        guard let host = req.host, hostIsAllowed(host) else {
-            sendAndClose(fd, 403, "Forbidden", "text/plain")
-            return
-        }
         updateClientPath(fd, path: req.path)
         let fmt = parseFormat(from: req.path)
         let isFast = req.path.contains("?fast=1") || req.path.contains("&fast=1")
@@ -181,21 +191,16 @@ final class ServerManager: NSObject, @unchecked Sendable {
             sendAndClose(fd, 200, "{\"status\":\"ok\",\"address\":\"\(address):\(port)\"}", "application/json")
             log("GET", "/health", ip, "", 0, 200)
         case ("POST", "/ocr"):
+            guard let length = req.contentLength, req.body.count == length else {
+                sendAndClose(fd, 400, "Invalid Content-Length", "text/plain")
+                return
+            }
             handleOCR(fd, req, ip, start, format: fmt, fast: isFast)
         case ("OPTIONS", _):
             sendAndClose(fd, 204, "", "text/plain")
         default:
             sendAndClose(fd, 404, "Not Found", "text/plain")
         }
-    }
-
-    /// Validate the Host header against DNS rebinding: only allow the machine's
-    /// own address, loopback, or localhost. Accepts optional `:port` suffix.
-    private func hostIsAllowed(_ host: String) -> Bool {
-        let bare = host.components(separatedBy: ":").first?.trimmingCharacters(in: .whitespaces) ?? ""
-        if bare.isEmpty { return false }
-        if bare == "localhost" || bare == "127.0.0.1" || bare == "::1" { return true }
-        return bare == address
     }
 
     private func parseFormat(from path: String) -> String {        guard let q = path.firstIndex(of: "?") else { return "html" }
@@ -212,14 +217,23 @@ final class ServerManager: NSObject, @unchecked Sendable {
     }
 
     private func handleOCR(_ fd: Int32, _ req: Req, _ ip: String, _ start: CFAbsoluteTime, format: String = "html", fast: Bool = false) {
+        guard ocrLimit.wait(timeout: .now()) == .success else {
+            sendAndClose(fd, 429, "OCR capacity reached", "text/plain")
+            return
+        }
+        defer { ocrLimit.signal() }
         guard let b = req.boundary else { sendAndClose(fd, 400, "{\"success\":false,\"error\":\"Expected multipart\"}", "application/json"); return }
         let files = parseMultiAll(req.body, b)
         guard !files.isEmpty else { sendAndClose(fd, 400, "{\"success\":false,\"error\":\"No image\"}", "application/json"); return }
+        guard files.count <= 16 else {
+            sendAndClose(fd, 413, "{\"success\":false,\"error\":\"Too many files\"}", "application/json")
+            return
+        }
 
-        // Reject files over the 250MB ingest stability limit (MAX_FILE_SIZE_INGEST).
-        let oversized = files.filter { $0.data.count > Int(OCRService.maxIngestBytes) }
+        let maxServerFileBytes = 16 * 1024 * 1024
+        let oversized = files.filter { $0.data.count > maxServerFileBytes }
         if !oversized.isEmpty {
-            sendAndClose(fd, 413, "{\"success\":false,\"error\":\"File too large (max 250MB)\"}", "application/json")
+            sendAndClose(fd, 413, "{\"success\":false,\"error\":\"File too large (max 16MB)\"}", "application/json")
             return
         }
 
@@ -248,7 +262,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         if format == "txt" {
             var txt = ""
             for r in results {
-                txt += "--- \(r.filename) ---\n\(r.text ?? "")\n\n"
+                txt += "--- \(r.filename) ---\n\(r.text)\n\n"
             }
             sendAndClose(fd, 200, txt, "text/plain; charset=utf-8")
             log("POST", "/ocr", ip, "\(results.count) files", el, 200)
@@ -266,7 +280,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         var optRows = ""
         var firstText = ""
         for (i, r) in results.enumerated() {
-            let txt = (r.text ?? "").isEmpty ? "(no text)" : r.text
+            let txt = r.text.isEmpty ? "(no text)" : r.text
             let safeTxt = txt.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;").replacingOccurrences(of: ">", with: "&gt;")
             let fn = esc(r.filename)
             let err = r.error ?? ""
@@ -295,13 +309,13 @@ final class ServerManager: NSObject, @unchecked Sendable {
     // MARK: - Helpers
 
     private func send(_ fd: Int32, _ status: Int, _ body: String, _ ct: String) {
-        let st = ["200":"OK","204":"No Content","400":"Bad Request","404":"Not Found","413":"Payload Too Large","500":"Internal Server Error"][String(status)] ?? ""
+        let st = ["200":"OK","204":"No Content","400":"Bad Request","404":"Not Found","408":"Request Timeout","413":"Payload Too Large","429":"Too Many Requests","500":"Internal Server Error","503":"Service Unavailable"][String(status)] ?? ""
         let bd = body.data(using: .utf8) ?? Data()
-        let resp = "HTTP/1.1 \(status) \(st)\r\nContent-Type: \(ct)\r\nContent-Length: \(bd.count)\r\nConnection: close\r\n\r\n"
+        let resp = "HTTP/1.1 \(status) \(st)\r\nContent-Type: \(ct)\r\nCache-Control: no-store\r\nContent-Length: \(bd.count)\r\nConnection: close\r\n\r\n"
         guard var data = resp.data(using: .utf8) else { return }; data.append(bd)
         // Make fd blocking so write() completes — the response is small and the socket closes after
-        var fl = fcntl(fd, F_GETFL, 0)
-        if fl >= 0 { fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) }
+        let fl = fcntl(fd, F_GETFL, 0)
+        if fl >= 0 { _ = fcntl(fd, F_SETFL, fl & ~O_NONBLOCK) }
         data.withUnsafeBytes { buf in
             guard let base = buf.baseAddress else { return }
             var written = 0
@@ -373,7 +387,7 @@ private struct BatchOCRResponse: Codable {
 
 private struct Req {
     let method: String; let path: String; let body: Data; let boundary: String?
-    let host: String?
+    let contentLength: Int?
     init?(_ data: Data) {
         // Find the end of headers first (before any binary body data)
         guard let hdrEnd = data.range(of: "\r\n\r\n".data(using: .utf8)!) else { return nil }
@@ -383,33 +397,55 @@ private struct Req {
         let rL = hL[0].components(separatedBy: " "); guard rL.count >= 2 else { return nil }
         method = rL[0]; path = rL[1]
         var h: [String: String] = [:]
-        for line in hL.dropFirst() { if let c = line.firstIndex(of: ":") { h[String(line[line.startIndex..<c]).trimmingCharacters(in: .whitespaces)] = String(line[line.index(after: c)...]).trimmingCharacters(in: .whitespaces) } }
-        body = Data(data[hdrEnd.upperBound...])
-        host = h["Host"]
-        if let ct = h["Content-Type"], ct.hasPrefix("multipart/form-data"), let br = ct.range(of: "boundary=") { boundary = String(ct[br.upperBound...]).trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "").removingPercentEncoding ?? "" } else { boundary = nil }
+        for line in hL.dropFirst() {
+            if let c = line.firstIndex(of: ":") {
+                let key = String(line[line.startIndex..<c]).trimmingCharacters(in: .whitespaces).lowercased()
+                h[key] = String(line[line.index(after: c)...]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        contentLength = h["content-length"].flatMap(Int.init)
+        let payload = Data(data[hdrEnd.upperBound...])
+        if let length = contentLength, length >= 0 {
+            body = Data(payload.prefix(length))
+        } else {
+            body = payload
+        }
+        if let ct = h["content-type"], ct.lowercased().hasPrefix("multipart/form-data"), let br = ct.range(of: "boundary=", options: .caseInsensitive) { boundary = String(ct[br.upperBound...]).trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "\"", with: "").removingPercentEncoding ?? "" } else { boundary = nil }
     }
 }
 
 private func localAddress() -> String? {
-    var addr: String?; var ifaddr: UnsafeMutablePointer<ifaddrs>?
-    guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }; defer { freeifaddrs(ifaddr) }
-    var cur = first
+    var ifaddr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return nil }
+    defer { freeifaddrs(ifaddr) }
+
+    var current = first
     while true {
-        let i = cur.pointee
-        guard let addrPtr = i.ifa_addr else { guard let next = i.ifa_next else { break }; cur = next; continue }
-        let f = addrPtr.pointee.sa_family
-        if f == AF_INET {
-            let name = String(cString: i.ifa_name)
+        let interface = current.pointee
+        if let address = interface.ifa_addr,
+           address.pointee.sa_family == AF_INET {
+            let name = String(cString: interface.ifa_name)
             if name.hasPrefix("en") || name.hasPrefix("eth") || name.hasPrefix("ap") {
-                var h = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                getnameinfo(addrPtr, socklen_t(addrPtr.pointee.sa_len), &h, socklen_t(h.count), nil, 0, NI_NUMERICHOST)
-                let c = String(cString: h)
-                if c != "127.0.0.1" && !c.hasPrefix("169.254") { addr = c; break }
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+                let value = String(cString: host)
+                if isPrivateIPv4(value) {
+                    return value
+                }
             }
         }
-        guard let next = i.ifa_next else { break }; cur = next
+        guard let next = interface.ifa_next else { break }
+        current = next
     }
-    return addr ?? "127.0.0.1"
+    return nil
+}
+
+private func isPrivateIPv4(_ value: String) -> Bool {
+    let octets = value.split(separator: ".").compactMap { Int($0) }
+    guard octets.count == 4, octets.allSatisfy({ (0...255).contains($0) }) else { return false }
+    return octets[0] == 10
+        || (octets[0] == 172 && (16...31).contains(octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
 }
 
 private let webHTML = """
@@ -544,6 +580,12 @@ private let webHTML = """
       <div id="cnt" aria-live="polite" style="font-size:13px;font-weight:600;margin-top:10px;color:var(--accent)"></div>
     </div>
 
+    <div id="cam-ui" class="cam-row" style="display:none">
+      <button class="btn" id="cam" type="button">📷 Take a Picture</button>
+      <video id="cam-preview" autoplay playsinline style="display:none;width:100%;border-radius:12px;margin-bottom:12px"></video>
+      <button class="btn" id="cam-cap" type="button" style="display:none">📸 Capture Photo</button>
+    </div>
+
     <button class="btn" id="go" type="submit">Run OCR</button>
     <div class="fast-row">
       <input type="checkbox" id="fast" name="fast" value="1">
@@ -578,6 +620,39 @@ private let webHTML = """
     const bad=sel.filter(f=>!exts.has(f.name.split('.').pop().toLowerCase())).length;
     if(bad){st.textContent='⚠️ '+bad+' of '+sel.length+' file(s) have unsupported formats';st.className='st e'}
     else{st.textContent='';st.className='st'}
+  }
+
+  // Camera capture — requires a secure context (HTTPS via the reverse proxy)
+  const camUI=document.getElementById('cam-ui'),cam=document.getElementById('cam'),
+        camPreview=document.getElementById('cam-preview'),camCap=document.getElementById('cam-cap');
+  if(window.isSecureContext&&navigator.mediaDevices&&navigator.mediaDevices.getUserMedia){
+    camUI.style.display='block';
+    let stream=null;
+    cam.addEventListener('click',async()=>{
+      try{
+        stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false});
+        camPreview.srcObject=stream;camPreview.style.display='block';
+        cam.style.display='none';camCap.style.display='block';
+        st.className='st';st.textContent='Camera live — capture the document';
+      }catch(err){
+        st.className='st e';st.textContent='Camera unavailable: '+err.message;
+      }
+    });
+    camCap.addEventListener('click',()=>{
+      const w=camPreview.videoWidth,h=camPreview.videoHeight;
+      if(!w||!h)return;
+      const cnv=document.createElement('canvas');cnv.width=w;cnv.height=h;
+      cnv.getContext('2d').drawImage(camPreview,0,0,w,h);
+      cnv.toBlob(blob=>{
+        if(!blob)return;
+        const file=new File([blob],'camera-'+Date.now()+'.jpg',{type:'image/jpeg'});
+        sel.push(file);updateCounter();
+        if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}
+        camPreview.srcObject=null;camPreview.style.display='none';
+        camCap.style.display='none';cam.style.display='block';
+        st.className='st';st.textContent='Photo added — ready to run OCR';
+      },'image/jpeg',0.9);
+    });
   }
 
   // Intercept form submit for AJAX with live timer
@@ -617,11 +692,3 @@ private let webHTML = """
 </body>
 </html>
 """
-
-
-
-
-
-
-
-

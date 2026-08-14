@@ -1,7 +1,7 @@
 # OCR Batch Processor
 
 macOS app for batch OCR using Apple Vision, accelerated by the Apple Neural
-Engine (ANE). Built-in HTTP server for sharing OCR over the local network.
+Engine (ANE). Built-in LAN HTTP server for OCR automation on the local network.
 
 ## Features
 
@@ -18,8 +18,9 @@ Engine (ANE). Built-in HTTP server for sharing OCR over the local network.
 - **File dropdown** — Browse per-file results via dropdown on native and web UI
 - **Copy & Save** — Copy individual file text, copy all, save all as `.txt`
 - **Clear** — Reset to initial state
-- **Network Server** — In-process HTTP server; upload from any browser on your
-  local network, browse per-file results
+- **Network Server** — In-process LAN HTTP server for local OCR automation
+- **Web camera capture** — Take a photo in the web UI (requires HTTPS via your
+  reverse proxy) and OCR it with the same pipeline
 - **History tab** — Records past OCR runs
 - **Dark mode** — System-adaptive colors throughout
 
@@ -45,6 +46,7 @@ constraints behind these settings.
 ```bash
 ./build.sh                 # release → ./dist/OCR App.app
 ./build.sh --debug         # debug build
+./build.sh --dmg           # also package ./dist/OCR App.dmg
 ./build.sh --open          # build then launch
 ./build.sh --output ~/Desktop   # custom output dir
 ```
@@ -54,8 +56,23 @@ constraints behind these settings.
 Open `OCR-App.xcodeproj` in Xcode (macOS 15+), then **Cmd+R**.
 
 > **Note:** The app is ad-hoc signed. On other Macs, right-click → Open to
-> bypass Gatekeeper. For proper distribution, sign with an Apple Developer ID
-> certificate and notarize.
+> bypass Gatekeeper the first time.
+
+### Distribute a .dmg (no Apple Developer Program fee)
+
+```bash
+./build.sh --dmg
+```
+
+Creates `dist/OCR App.dmg`. Host it anywhere — your own server, a shared drive,
+or GitHub Releases. Users mount the DMG and drag the app to **/Applications**.
+
+Because the app isn't signed with an Apple Developer ID or notarized, Gatekeeper
+shows a warning on first launch. Users bypass it once via **right-click → Open**,
+or **System Settings → Privacy & Security → Open Anyway**. This is fine for
+trusted users on your own network. Only distribution to unknown/public users
+needs the paid **$99/year Apple Developer Program** for Developer ID signing +
+notarization.
 
 ## Usage
 
@@ -71,15 +88,15 @@ Open `OCR-App.xcodeproj` in Xcode (macOS 15+), then **Cmd+R**.
 ### Network Server
 
 1. Go to the **Server** tab and click **Start Server**
-2. The app shows the address (e.g. `http://192.168.2.6:8080`)
+2. The app shows the LAN address (e.g. `http://192.168.2.6:8080`)
 3. Open it from any device on your network
-4. Select files → tap **Run OCR** — results page shows dropdown + per-file output
+4. Select files or take a photo → tap **Run OCR** — results page shows dropdown + per-file output
 5. **💾 Save All** / **📋 Copy** / **✕ Clear**
 
 API details in [`API.md`](API.md). Notable options:
 - `?format=json` or `?format=txt` — output format
 - `?fast=1` — fast recognition mode
-- Uploads over **250MB** are rejected (HTTP 413)
+- Uploads over **64MB**, individual files over **16MB**, or batches over 16 files are rejected (HTTP 413)
 
 ### CLI Benchmark
 

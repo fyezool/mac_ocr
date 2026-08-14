@@ -88,7 +88,7 @@ struct ServerTabView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
 
-                Text("Connect via HTTP — the OCR API is available at the address above")
+                Text("LAN HTTP API — the address above is reachable from local-network devices.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
