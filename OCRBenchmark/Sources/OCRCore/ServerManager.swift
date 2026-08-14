@@ -7,40 +7,60 @@ import Glibc
 
 // MARK: - Client Tracking
 
-struct ConnectedClient: Identifiable, Sendable {
-    let id: UUID
-    let ip: String
-    let connectedAt: Date
-    let path: String
-    let isActive: Bool
-    let duration: TimeInterval
+public struct ConnectedClient: Identifiable, Sendable {
+    public let id: UUID
+    public let ip: String
+    public let connectedAt: Date
+    public let path: String
+    public let isActive: Bool
+    public let duration: TimeInterval
 
-    var label: String { isActive ? "active" : "done" }
+    public var label: String { isActive ? "active" : "done" }
+
+    public init(id: UUID, ip: String, connectedAt: Date, path: String, isActive: Bool, duration: TimeInterval) {
+        self.id = id
+        self.ip = ip
+        self.connectedAt = connectedAt
+        self.path = path
+        self.isActive = isActive
+        self.duration = duration
+    }
 }
 
 // MARK: - Server Event
-struct ServerLogEntry: Sendable {
-    let id: UUID; let method: String; let path: String; let remote: String
-    let filename: String; let duration: TimeInterval; let status: Int; let timestamp: Date
+public struct ServerLogEntry: Sendable {
+    public let id: UUID; public let method: String; public let path: String; public let remote: String
+    public let filename: String; public let duration: TimeInterval; public let status: Int; public let timestamp: Date
+
+    public init(id: UUID, method: String, path: String, remote: String, filename: String, duration: TimeInterval, status: Int, timestamp: Date) {
+        self.id = id
+        self.method = method
+        self.path = path
+        self.remote = remote
+        self.filename = filename
+        self.duration = duration
+        self.status = status
+        self.timestamp = timestamp
+    }
 }
 
-final class ServerManager: NSObject, @unchecked Sendable {
+public final class ServerManager: NSObject, @unchecked Sendable {
     private var sockfd: Int32 = -1
     private var source: DispatchSourceRead?
     private var running = false
     private let queue = DispatchQueue(label: "ocr-server", qos: .userInitiated, attributes: .concurrent)
     private var logEntries: [ServerLogEntry] = []
     private let logLock = NSLock()
-    var onStatusChange: ((Bool, String) -> Void)?
-    var onNewLogEntry: ((ServerLogEntry) -> Void)?
-    var onClientsChanged: (([ConnectedClient]) -> Void)?
-    var isRunning: Bool { running }
-    var port: UInt16 = 8080
-    private(set) var address: String = "127.0.0.1"
+    public var onStatusChange: ((Bool, String) -> Void)?
+    public var onNewLogEntry: ((ServerLogEntry) -> Void)?
+    public var onClientsChanged: (([ConnectedClient]) -> Void)?
+    public var isRunning: Bool { running }
+    public var port: UInt16 = 8080
+    private(set) public var address: String = "127.0.0.1"
     private let connectionLimit = DispatchSemaphore(value: 16)
     private let ocrLimit = DispatchSemaphore(value: 2)
-    var urlString: String { "http://\(address):\(port)" }
-    var recentLog: [ServerLogEntry] {
+    public var urlString: String { "http://\(address):\(port)" }
+    public var recentLog: [ServerLogEntry] {
         logLock.lock(); defer { logLock.unlock() }
         return Array(logEntries.suffix(20))
     }
@@ -49,7 +69,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
     private var activeClients: [Int32: ConnectedClient] = [:]
     private var completedClients: [ConnectedClient] = []
     private let clientLock = NSLock()
-    var connectedClients: [ConnectedClient] {
+    public var connectedClients: [ConnectedClient] {
         clientLock.lock(); defer { clientLock.unlock() }
         return Array(activeClients.values) + completedClients
     }
@@ -84,7 +104,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         DispatchQueue.main.async { self.onClientsChanged?(self.connectedClients) }
     }
 
-    func start(port: UInt16 = 8080) {
+    public func start(port: UInt16 = 8080) {
         queue.async { self._start(port: port) }
     }
 
@@ -133,7 +153,7 @@ final class ServerManager: NSObject, @unchecked Sendable {
         running = true; notifyStatus()
     }
 
-    func stop() { queue.async { self._stop() } }
+    public func stop() { queue.async { self._stop() } }
 
     private func _stop() { source?.cancel(); source = nil; sockfd = -1; running = false; DispatchQueue.main.async { self.notifyStatus() } }
 

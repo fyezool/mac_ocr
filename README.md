@@ -183,13 +183,14 @@ Repeated runs with stats:
 │   ├── OCRViewModel.swift       # OCR state + actions
 │   ├── ServerTabView.swift      # Server tab UI
 │   ├── ServerViewModel.swift    # Server state
-│   ├── HistoryTabView.swift     # History tab
-│   └── ServerManager.swift      # Embedded HTTP server (BSD sockets + GCD)
+│   └── HistoryTabView.swift     # History tab
 ├── OCR-App.xcodeproj/           # Xcode project
 ├── OCRBenchmark/                # CLI benchmark tool (Swift Package)
 │   └── Sources/OCRCore/         # SHARED implementation (compiled into the
 │       ├── OCRService.swift         app and benchmark): OCR + PDF + enhance
-│       └── ServerSupport.swift      + parsing (multipart, magic bytes, models)
+│       ├── ServerSupport.swift      + parsing (multipart, magic bytes, models)
+│       └── ServerManager.swift      + the embedded HTTP server (BSD sockets + GCD)
+│   └── Tests/OCRCoreTests/      # Unit + live-server integration tests
 ├── docs/
 │   └── ANE_ENGINEERING_RULESET.md  # ANE/Vision constraints for agents
 ├── API.md                       # HTTP API documentation
@@ -199,7 +200,9 @@ Repeated runs with stats:
 
 > **Note:** the GUI, the HTTP server, and the benchmark all compile the **same**
 > `OCRCore` sources — what you benchmark is what you deploy. The server's
-> parsing/validation logic lives in `ServerSupport` so it's unit-testable.
+> parsing/validation logic lives in `ServerSupport` and the socket server in
+> `ServerManager`, both unit-testable; `Tests/OCRCoreTests` even spins up a live
+> server and drives it over real HTTP requests.
 
 ## Requirements
 
