@@ -417,6 +417,9 @@ final class ServerManager: NSObject, @unchecked Sendable {
             strategy: agent.mode ?? "accurate",
             engine: "vision",
             engine_revision: OCRService.visionRevisionLabel(),
+            // The structured pipeline always uses RecognizeTextRequest so that
+            // per-line confidence and bounding boxes are available on every OS.
+            engine_api: "RecognizeTextRequest",
             language: agent.languages?.first ?? "en-US"
         )
         let json = ((try? JSONEncoder().encode(resp)).flatMap { String(data: $0, encoding: .utf8) }) ?? "[]"
@@ -569,6 +572,7 @@ private struct StructuredBatchResponse: Codable {
     let strategy: String
     let engine: String
     let engine_revision: String
+    let engine_api: String
     let language: String
 }
 

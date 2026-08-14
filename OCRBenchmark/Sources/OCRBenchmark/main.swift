@@ -221,7 +221,7 @@ struct OCRBenchmark {
                 + pad(String(format: "%.0f", p50 * 1000), 11) + pad(String(format: "%.0f", p95 * 1000), 11) + String(format: "%.0f", p99 * 1000))
 
             var run: [String: Any] = [
-                "concurrency": level,
+                "concurrency": concurrencyInfo(requested: level),
                 "wall_clock_seconds": elapsed,
                 "throughput_img_s": throughput,
                 "p50_latency_ms": p50 * 1000,
@@ -256,6 +256,7 @@ struct OCRBenchmark {
         var retriedFiles = 0
         var accuracy: AccuracySummary?
         var stats: [String: Any] = [:]
+        var perFile: [[String: Any]] = []
     }
 
     /// fast probe → retry accurate on low-confidence items, compared against an
@@ -299,6 +300,7 @@ struct OCRBenchmark {
         } else {
             var adaptive = adaptiveStats
             if let accuracyAdaptive { adaptive["accuracy"] = accuracyJSON(accuracyAdaptive) }
+            adaptive["per_file"] = result.perFile
             var baseline = baselineStats
             if let accuracyBaseline { baseline["accuracy"] = accuracyJSON(accuracyBaseline) }
             let output: [String: Any] = [
@@ -338,6 +340,7 @@ struct OCRBenchmark {
 
         let pathByKey = Dictionary(images.map { (ownerKey($0.lastPathComponent), $0.path) }, uniquingKeysWith: { a, _ in a })
         var retryPaths = Set<String>()
+        var retryReason: [String: String] = [:]
         for item in fastItems {
             guard let path = pathByKey[ownerKey(item.filename)] else { continue }
             let lowMean = (item.meanConfidence ?? 0) < threshold
@@ -345,6 +348,10 @@ struct OCRBenchmark {
             let manyLow = (item.lowConfidenceRatio ?? 0) > 0.25
             if item.text.isEmpty || lowMean || catastrophic || manyLow {
                 retryPaths.insert(path)
+                if item.text.isEmpty { retryReason[item.filename] = "empty_text" }
+                else if catastrophic { retryReason[item.filename] = "min_confidence" }
+                else if manyLow { retryReason[item.filename] = "low_ratio" }
+                else { retryReason[item.filename] = "mean_confidence" }
             }
         }
         let retryList = paths.filter { retryPaths.contains($0) }
@@ -365,12 +372,28 @@ struct OCRBenchmark {
         }
         let wall = CFAbsoluteTimeGetCurrent() - totalStart
 
+        var perFile: [[String: Any]] = []
+        for item in fastItems {
+            let retried = accurateByFilename[item.filename] != nil
+            var entry: [String: Any] = [
+                "filename": item.filename,
+                "engine_used": retried ? "fast+accurate" : "fast",
+                "mean_confidence": item.meanConfidence ?? NSNull(),
+                "min_confidence": item.minConfidence ?? NSNull(),
+                "p10_confidence": item.p10Confidence ?? NSNull(),
+                "low_conf_ratio": item.lowConfidenceRatio ?? NSNull(),
+            ]
+            if retried { entry["retry_reason"] = retryReason[item.filename] ?? "confidence" }
+            perFile.append(entry)
+        }
+
         var result = AdaptiveRunResult()
         result.finalItems = finalItems
         result.wall = wall
         result.retriedFiles = retryPaths.count
         result.accuracy = options.referencesDir.map { computeAccuracy(results: finalItems, referencesDir: $0) }
         result.stats = runStats(finalItems, wall: wall)
+        result.perFile = perFile
         return result
     }
 
@@ -627,8 +650,25 @@ struct OCRBenchmark {
             "automatically_detects_language": autoLang,
             "concurrency": concurrencyInfo(requested: concurrency),
             "force_legacy_engine": legacyEngine,
+            "engine_api": visionEngineAPI(level: level, legacyEngine: legacyEngine),
             "vision_revision": OCRService.visionRevisionLabel(),
         ]
+    }
+
+    /// Which Vision request type is used for a given recognition level. The
+    /// adaptive ("fast+accurate") path mixes engines on macOS 26, which matters
+    /// when interpreting benchmark results.
+    private static func visionEngineAPI(level: String, legacyEngine: Bool) -> String {
+        if level.contains("fast") && level.contains("accurate") {
+            return "fast=RecognizeTextRequest,accurate=\(accurateAPI(legacy: legacyEngine))"
+        }
+        if level == "fast" { return "RecognizeTextRequest" }
+        return accurateAPI(legacy: legacyEngine)
+    }
+
+    private static func accurateAPI(legacy: Bool) -> String {
+        if #available(macOS 26.0, *), !legacy { return "RecognizeDocumentsRequest" }
+        return "RecognizeTextRequest"
     }
 
     /// Report requested vs effective concurrency so published sweep graphs are

@@ -255,13 +255,17 @@ curl -X POST \
   "strategy": "adaptive",
   "engine": "vision",
   "engine_revision": "revision3",
+  "engine_api": "RecognizeTextRequest",
   "language": "ms-MY"
 }
 ```
 
 `strategy` reports the mode used. `engine_revision` records the Vision
 text-recognition request revision so results can be correlated with the
-underlying engine version. Without an `options` field, `POST /ocr`
+underlying engine version. `engine_api` records which Vision request type the
+structured pipeline used — it always uses `RecognizeTextRequest` (rather than
+macOS 26's `RecognizeDocumentsRequest`) so per-line confidence and bounding
+boxes are available on every OS. Without an `options` field, `POST /ocr`
 behaves exactly as documented above.
 
 ---

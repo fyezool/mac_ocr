@@ -43,12 +43,14 @@
   (`DocumentObservation`, `RecognizeDocumentsRequest`) require it.
 
 ### Coordinate translation (searchable PDF layers)
-Vision uses normalized `[0,1]` coords with **top-left origin**; Core Graphics PDFs
-use **bottom-left**:
+Vision `boundingBox` uses normalized `[0,1]` coords with **bottom-left origin**
+(the code confirms this — `y = (1 − rect.y − rect.height) × H`). Core Graphics
+PDFs use **bottom-left** too, so the flip below only applies when going from a
+Vision normalized box to a **top-left-origin** bitmap (e.g. CGImage cropping):
 
 ```
-X_pdf = X_vision × W_page
-Y_pdf = (1 − Y_vision − H_vision) × H_page
+X_bitmap = X_vision × W_image
+Y_bitmap = (1 − Y_vision − H_vision) × H_image
 ```
 
 ## 4. Private-API Constraints — Knowledge Only, Never Implement

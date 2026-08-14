@@ -24,6 +24,7 @@ public struct OCRItem: Codable, Sendable {
 public struct ConfidenceStats: Codable, Sendable {
     public let mean: Double?
     public let min: Double?
+    public let p10: Double?
     public let lowRatio: Double?
 }
 
@@ -36,15 +37,17 @@ public struct OCRDetailedItem: Codable, Sendable {
     public let duration: TimeInterval
     public let meanConfidence: Double?
     public let minConfidence: Double?
+    public let p10Confidence: Double?
     public let lowConfidenceRatio: Double?
 
-    public init(filename: String, text: String, error: String?, duration: TimeInterval, meanConfidence: Double?, minConfidence: Double? = nil, lowConfidenceRatio: Double? = nil) {
+    public init(filename: String, text: String, error: String?, duration: TimeInterval, meanConfidence: Double?, minConfidence: Double? = nil, p10Confidence: Double? = nil, lowConfidenceRatio: Double? = nil) {
         self.filename = filename
         self.text = text
         self.error = error
         self.duration = duration
         self.meanConfidence = meanConfidence
         self.minConfidence = minConfidence
+        self.p10Confidence = p10Confidence
         self.lowConfidenceRatio = lowConfidenceRatio
     }
 }
@@ -250,7 +253,7 @@ public enum OCRService {
         do {
             let (text, stats) = try await recognizeTextWithConfidence(in: imageData, config: config)
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            return (index, OCRDetailedItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed, meanConfidence: stats.mean, minConfidence: stats.min, lowConfidenceRatio: stats.lowRatio))
+            return (index, OCRDetailedItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed, meanConfidence: stats.mean, minConfidence: stats.min, p10Confidence: stats.p10, lowConfidenceRatio: stats.lowRatio))
         } catch {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
             return (index, OCRDetailedItem(filename: url.lastPathComponent, text: "", error: error.localizedDescription, duration: elapsed, meanConfidence: nil))
@@ -428,7 +431,7 @@ public enum OCRService {
             do {
                 let (text, stats) = try await recognizeTextWithConfidence(in: pngData, config: config)
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
-                items.append(OCRDetailedItem(filename: pageName, text: text, error: nil, duration: elapsed, meanConfidence: stats.mean, minConfidence: stats.min, lowConfidenceRatio: stats.lowRatio))
+                items.append(OCRDetailedItem(filename: pageName, text: text, error: nil, duration: elapsed, meanConfidence: stats.mean, minConfidence: stats.min, p10Confidence: stats.p10, lowConfidenceRatio: stats.lowRatio))
             } catch {
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
                 items.append(OCRDetailedItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed, meanConfidence: nil))
@@ -475,7 +478,7 @@ public enum OCRService {
     /// Same layout reconstruction as `reconstructParagraphs`, additionally
     /// returning the mean confidence of the recognized text observations.
     private static func reconstructParagraphsWithConfidence(from observations: [RecognizedTextObservation]) -> (text: String, stats: ConfidenceStats) {
-        guard !observations.isEmpty else { return ("", ConfidenceStats(mean: nil, min: nil, lowRatio: nil)) }
+        guard !observations.isEmpty else { return ("", ConfidenceStats(mean: nil, min: nil, p10: nil, lowRatio: nil)) }
 
         // Adaptive threshold from median line height
         let heights = observations.map { $0.boundingBox.height }
@@ -528,9 +531,16 @@ public enum OCRService {
         let stats = ConfidenceStats(
             mean: confidences.isEmpty ? nil : Double(confidences.reduce(0.0) { $0 + Double($1) } / Double(confidences.count)),
             min: confidences.min().map(Double.init),
+            p10: percentile(confidences.map(Double.init), 0.10),
             lowRatio: confidences.isEmpty ? nil : Double(confidences.filter { $0 < 0.5 }.count) / Double(confidences.count)
         )
         return (result, stats)
+    }
+
+    private static func percentile(_ sortedSource: [Double], _ p: Double) -> Double? {
+        let sorted = sortedSource.sorted()
+        guard !sorted.isEmpty else { return nil }
+        return sorted[Int((Double(sorted.count - 1) * p).rounded())]
     }
 
     public static func collectImages(from directory: URL) -> [URL] {
