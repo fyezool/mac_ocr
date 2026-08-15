@@ -192,25 +192,28 @@ public final class ServerManager: NSObject, @unchecked Sendable {
             let n = read(fd, &tmp, tmp.count)
             if n > 0 {
                 buf.append(tmp, count: n); attempts = 0
+                // Locate the header terminator BEFORE the header-size check: a
+                // whole request (header + body) can arrive in one read, and the
+                // 32KB cap applies to the HEADER only, not to buffered body bytes.
+                if hdrEndPos < 0, let r = buf.range(of: "\r\n\r\n".data(using: .utf8)!) {
+                    hdrEndPos = r.upperBound
+                    if let hdrStr = String(data: buf[buf.startIndex..<r.lowerBound], encoding: .utf8) {
+                        for line in hdrStr.components(separatedBy: "\r\n") {
+                            if let c = line.firstIndex(of: ":"), line.lowercased().hasPrefix("content-length") {
+                                contentLength = Int(line[line.index(after: c)...].trimmingCharacters(in: .whitespaces)) ?? -1
+                                // Reject immediately if the declared length exceeds the cap —
+                                // don't buffer up to 1GB from a slow stream.
+                                if contentLength > maxRequestBytes { tooLarge = true }
+                            }
+                        }
+                    }
+                }
                 if hdrEndPos < 0, buf.count > maxHeaderBytes { tooLarge = true; break }
                 if buf.count > maxRequestBytes { tooLarge = true; break }
             }
             else if n == 0 { break }
             else if errno == EAGAIN || errno == EWOULDBLOCK { attempts += 1; usleep(10000); continue }
             else { break }
-            if hdrEndPos < 0, let r = buf.range(of: "\r\n\r\n".data(using: .utf8)!) {
-                hdrEndPos = r.upperBound
-                if let hdrStr = String(data: buf[buf.startIndex..<r.lowerBound], encoding: .utf8) {
-                    for line in hdrStr.components(separatedBy: "\r\n") {
-                        if let c = line.firstIndex(of: ":"), line.lowercased().hasPrefix("content-length") {
-                            contentLength = Int(line[line.index(after: c)...].trimmingCharacters(in: .whitespaces)) ?? -1
-                            // Reject immediately if the declared length exceeds the cap —
-                            // don't buffer up to 1GB from a slow stream.
-                            if contentLength > maxRequestBytes { tooLarge = true }
-                        }
-                    }
-                }
-            }
             if hdrEndPos >= 0, contentLength >= 0, buf.count - hdrEndPos >= contentLength { break }
             if hdrEndPos >= 0, contentLength < 0 { break }
         }
@@ -507,6 +510,7 @@ private let webHTML = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<link rel="icon" href="data:,">
 <title>OCR</title>
 <style>
   :root {
@@ -566,6 +570,7 @@ private let webHTML = """
 
   /* Drop Zone — tap to browse (label wrapping a hidden file input) or drag & drop */
   .zone{
+    display:block;
     border:2px dashed var(--drop-border);border-radius:16px;
     padding:36px 24px;text-align:center;margin-bottom:20px;
     background:var(--drop-bg);

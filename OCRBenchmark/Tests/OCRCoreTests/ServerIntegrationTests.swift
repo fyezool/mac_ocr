@@ -149,6 +149,33 @@ final class ServerIntegrationTests: XCTestCase {
         XCTAssertTrue(html.contains("for=\"file\""), "tap zone is not wired to the picker")
     }
 
+    func testServerAcceptsBodyLargerThanHeaderCap() async throws {
+        // Regression: when header + body arrive in one read, the total could
+        // exceed the 32KB header cap and be misrejected as 413. A >32KB body
+        // must still be accepted.
+        let w = 800, h = 240
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return XCTFail("ctx") }
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        srand48(7)   // deterministic random noise: PNG of this won't compress small
+        for _ in 0..<(w * h / 6) {
+            let x = Int(drand48() * Double(w))
+            let y = Int(drand48() * Double(h))
+            ctx.setFillColor(CGColor(red: drand48(), green: drand48(), blue: drand48(), alpha: 1))
+            ctx.fill(CGRect(x: x, y: y, width: 2, height: 2))
+        }
+        guard let img = ctx.makeImage(),
+              let png = NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:]) else { return XCTFail("png") }
+        XCTAssertGreaterThan(png.count, 32 * 1024, "test needs a body over the 32KB header cap")
+
+        let (srv, url) = try await startServer()
+        defer { srv.stop() }
+        let (status, data) = try await Self.post(url, files: [("big.png", png)], options: nil, format: "json")
+        XCTAssertEqual(status, 200, ">32KB body rejected: \(String(data: data, encoding: .utf8) ?? "")")
+    }
+
     func testConcurrentRequestsAllSucceed() async throws {
         guard let png = makePNG() else { return XCTFail("could not make PNG") }
         let (srv, url) = try await startServer()

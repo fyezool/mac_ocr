@@ -43,3 +43,6 @@ reasonix.toml
 
 # Cross-machine benchmark corpus runs (not committed)
 corpus/results/
+
+# Browser automation (playwright) artifacts
+.playwright-mcp/
