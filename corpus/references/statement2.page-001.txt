@@ -1,0 +1,8 @@
+Quotation No. Q-2026-0142
+Client: Fyezool Technologies Sdn Bhd
+Item              Qty      Amount
+OCR integration      3     RM 9,000.00
+API development       2     RM 12,500.00
+Subtotal                   RM 21,500.00
+SST 6%                     RM 1,290.00
+Total                      RM 22,790.00

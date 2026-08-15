@@ -11,8 +11,12 @@
 
 - We run OCR through **Vision framework** (`RecognizeTextRequest` on macOS < 26,
   `RecognizeDocumentsRequest` on macOS 26+) — the public, App Store–safe path.
-- Vision internally uses **Core ML** to dispatch to the **ANE** (Apple Neural
-  Engine). We get its efficiency (~12× vs CPU on M-series) for free.
+- Vision internally **may** use **Core ML** to dispatch to the **ANE** (Apple
+  Neural Engine). We get its efficiency (~12× vs CPU on M-series, practitioner
+  evidence) for free. **Caveat:** the benchmark measures the Vision API stack
+  (Vision + Core ML + ANE + memory/OS + model revision), not ANE utilization
+  directly — Apple exposes no per-request ANE telemetry. Claim "Vision OCR
+  performance across Apple Silicon generations," not "ANE performance."
 - **Never** adopt the private `_ANEClient` / `_ANECompiler` route: it is
   undocumented, version-fragile, breaks App Store approval, and requires
   satisfying 20+ fragile constraints (see §4). Treat §4 as knowledge only.
@@ -79,7 +83,7 @@ down this path:
 |---|---|---|
 | `ANE_FP16_MAX` | `65504.0` | Clamp bound if ever doing custom numerics |
 | `ANE_DISPATCH_MIN_S` | `0.0023` | Amortization floor — batch full pages |
-| `ANE_SRAM_BYTES` | `33_554_432` (32MB) | Empirically observed working-set cliff (not a documented hardware limit) |
+| `ANE_SRAM_BYTES` | `33_554_432` (32MB) | **Empirical working-set performance cliff observed on this workload/device** — NOT a documented Apple hardware budget. Treat as a heuristic for agent tuning, not an architecture constant |
 | `OCR_CONCURRENCY_CEILING` | `4` (app) / `16` (benchmark) | `OCRService.clampedConcurrency` |
 | `VISION_GLOBAL_BUDGET` | `4` (app default) / `16` (benchmark) | `OCRService.defaultVisionConcurrency`; benchmark raises via `setVisionConcurrencyLimit`, caps total in-flight Vision `perform` calls process-wide |
 | `PDF_RENDER_DPI_TARGET` | `200` | `renderScale(for:)` |

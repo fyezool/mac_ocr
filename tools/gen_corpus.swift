@@ -16,7 +16,7 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-let corpusVersion = "1.0"
+let corpusVersion = "1.1"
 let schemaVersion = "1.0"
 
 // MARK: - Rendering helpers (NSBitmapImageRep-backed; AppKit sets up the whole
@@ -120,16 +120,18 @@ func pngData(from rep: NSBitmapImageRep) -> Data? {
     rep.representation(using: .png, properties: [:])
 }
 
-func writePDF(reference: String, to url: URL) {
-    // Render the text to a bitmap and embed it in a one-page PDF — avoids any
+func writePDF(pages: [String], to url: URL) {
+    // Render each page's text to a bitmap and embed it in the PDF — avoids any
     // text-into-CG-PDF-context fragility, and PDFKit re-renders it to an image.
-    guard let rep = renderRep(text: reference, font: NSFont.systemFont(ofSize: 18), w: 1000, h: 620),
-          let cg = rep.cgImage else { return }
     var media = CGRect(x: 0, y: 0, width: 612, height: 792)
     guard let ctx = CGContext(url as CFURL, mediaBox: &media, nil) else { return }
-    ctx.beginPDFPage(nil)
-    ctx.draw(cg, in: CGRect(x: 56, y: 120, width: 500, height: 310))
-    ctx.endPDFPage()
+    for text in pages {
+        guard let rep = renderRep(text: text, font: NSFont.systemFont(ofSize: 18), w: 1000, h: 620),
+              let cg = rep.cgImage else { continue }
+        ctx.beginPDFPage(nil)
+        ctx.draw(cg, in: CGRect(x: 56, y: 120, width: 500, height: 310))
+        ctx.endPDFPage()
+    }
     ctx.closePDF()
 }
 
@@ -142,7 +144,22 @@ struct File {
     let layout: String
     let ext: String
     let notes: String
+    /// Multi-page PDF convention: page-indexed reference files
+    /// `<base>.page-NNN.txt` (one per page). When set, `reference` is unused.
+    let pageReferences: [(page: Int, text: String)]?
     let render: (URL) -> Bool   // returns true on success
+
+    init(id: String, reference: String, language: String, layout: String, ext: String, notes: String,
+         pageReferences: [(page: Int, text: String)]? = nil, render: @escaping (URL) -> Bool) {
+        self.id = id
+        self.reference = reference
+        self.language = language
+        self.layout = layout
+        self.ext = ext
+        self.notes = notes
+        self.pageReferences = pageReferences
+        self.render = render
+    }
 }
 
 func imageFile(id: String, reference: String, language: String, layout: String, notes: String,
@@ -202,10 +219,11 @@ files.append(imageFile(
     text: "This line is rotated three degrees about the image centre.\nDetection must still locate and read it correctly.",
     font: bodyFont, w: 1100, h: 340, rotation: 3))
 
-// 6. Cursive script (handwriting-like)
+// 6. Script font (handwriting-LIKE — a cursive system font, NOT real
+//    handwriting; rename and treat accordingly)
 files.append(imageFile(
-    id: "cursive", reference: "A quick brown fox jumps over the lazy dog\nwritten in a cursive hand for handwriting-like OCR.",
-    language: "en-US", layout: "cursive", notes: "Cursive script font, handwriting-like",
+    id: "script_font", reference: "A quick brown fox jumps over the lazy dog\nwritten in a cursive hand for handwriting-like OCR.",
+    language: "en-US", layout: "script_font", notes: "Cursive SCRIPT FONT (Apple Chancery) — font recognition, not handwriting recognition",
     text: "A quick brown fox jumps over the lazy dog\nwritten in a cursive hand for handwriting-like OCR.",
     font: NSFont(name: "Apple Chancery", size: 30) ?? bodyFont, w: 1100, h: 260))
 
@@ -249,7 +267,19 @@ let statementPDF = "Monthly Statement of Account\nAccount number: 1234-5678-9012
 files.append(File(
     id: "statement", reference: statementPDF, language: "en-US", layout: "pdf", ext: "pdf",
     notes: "Single-page PDF — exercises the (page N) path") { url in
-    writePDF(reference: statementPDF, to: url)
+    writePDF(pages: [statementPDF], to: url)
+    return FileManager.default.fileExists(atPath: url.path)
+})
+
+// 13. Two-page PDF — exercises the page-indexed reference convention
+//     (`statement2.page-001.txt` / `statement2.page-002.txt`).
+let statement2Page1 = "Quotation No. Q-2026-0142\nClient: Fyezool Technologies Sdn Bhd\nItem              Qty      Amount\nOCR integration      3     RM 9,000.00\nAPI development       2     RM 12,500.00\nSubtotal                   RM 21,500.00\nSST 6%                     RM 1,290.00\nTotal                      RM 22,790.00"
+let statement2Page2 = "Terms: 30 days net from invoice date.\nPayment: bank transfer to MAYBANK 5123-4567-8901.\nThis quotation is valid for 90 days from the date of issue."
+files.append(File(
+    id: "statement2", reference: statement2Page1, language: "en-MS", layout: "pdf", ext: "pdf",
+    notes: "Two-page PDF — validates page-indexed reference lookup",
+    pageReferences: [(1, statement2Page1), (2, statement2Page2)]) { url in
+    writePDF(pages: [statement2Page1, statement2Page2], to: url)
     return FileManager.default.fileExists(atPath: url.path)
 })
 
@@ -269,15 +299,27 @@ for f in files {
         print("❌ failed to render \(f.id).\(f.ext)")
         continue
     }
-    try? f.reference.write(toFile: refPath, atomically: true, encoding: .utf8)
-    manifestFiles.append([
+    if let pageRefs = f.pageReferences {
+        for (page, text) in pageRefs {
+            let pr = (refsDir as NSString).appendingPathComponent("\(f.id).page-\(String(format: "%03d", page)).txt")
+            try? text.write(toFile: pr, atomically: true, encoding: .utf8)
+        }
+    } else {
+        try? f.reference.write(toFile: refPath, atomically: true, encoding: .utf8)
+    }
+    var entry: [String: Any] = [
         "id": f.id,
         "filename": "\(f.id).\(f.ext)",
-        "reference": "\(f.id).txt",
         "language": f.language,
         "layout": f.layout,
         "notes": f.notes,
-    ])
+    ]
+    if let pageRefs = f.pageReferences {
+        entry["reference"] = pageRefs.map { "\(f.id).page-\(String(format: "%03d", $0.page)).txt" }
+    } else {
+        entry["reference"] = "\(f.id).txt"
+    }
+    manifestFiles.append(entry)
     print("✓ \(f.id).\(f.ext)  (\(f.layout), \(f.language))")
 }
 

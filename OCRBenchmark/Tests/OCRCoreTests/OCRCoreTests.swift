@@ -1,5 +1,5 @@
 import XCTest
-import OCRCore
+@testable import OCRCore
 
 final class OCRCoreTests: XCTestCase {
 
@@ -29,6 +29,26 @@ final class OCRCoreTests: XCTestCase {
 
         let empty = OCRService.cerDetail(reference: "", predicted: "x")
         XCTAssertEqual(empty.rate, 1)
+    }
+
+    func testStrictMetrics() {
+        // Normalization hides punctuation/case differences; strict must not.
+        let norm = OCRService.cerDetail(reference: "RM 1,250.00", predicted: "rm 1.250.00")
+        let strict = OCRService.cerStrictDetail(reference: "RM 1,250.00", predicted: "rm 1.250.00")
+        XCTAssertGreaterThan(strict.rate, norm.rate, "strict CER should penalize case/punctuation")
+
+        XCTAssertEqual(OCRService.cerStrictDetail(reference: "Hello", predicted: "hello").dist, 1)
+        XCTAssertEqual(OCRService.cerStrictDetail(reference: "Hello", predicted: "Hello").dist, 0)
+        XCTAssertEqual(OCRService.werStrictDetail(reference: "one TWO", predicted: "one two").dist, 1)
+        XCTAssertEqual(OCRService.werStrictDetail(reference: "one two", predicted: "one two").dist, 0)
+    }
+
+    func testPageNumberExtraction() {
+        XCTAssertEqual(OCRService.pageNumber(from: "foo.pdf (page 3)"), 3)
+        XCTAssertEqual(OCRService.pageNumber(from: "foo.pdf (page 12)"), 12)
+        XCTAssertNil(OCRService.pageNumber(from: "foo.png"))
+        XCTAssertNil(OCRService.pageNumber(from: "foo.pdf"))
+        XCTAssertNil(OCRService.pageNumber(from: ""))
     }
 
     func testWERDetail() {
@@ -135,6 +155,60 @@ final class OCRCoreTests: XCTestCase {
         XCTAssertEqual(OCRService.visionConcurrencyLimit(), 1)
         OCRService.setVisionConcurrencyLimit(original)
         XCTAssertEqual(OCRService.visionConcurrencyLimit(), original)
+    }
+
+    /// Regression test for the check-then-enqueue race that could park an
+    /// acquirer forever: the capacity check + claim-or-enqueue must be atomic.
+    func testVisionGateAcquireReleaseRoundtrip() async {
+        let gate = OCRService.visionGate
+        gate.setLimit(2)
+        await gate.acquire()
+        await gate.acquire()          // budget exhausted (active == limit)
+
+        // A third acquirer must block, then complete once a slot is released.
+        let thirdFinished = await withTaskGroup(of: Bool.self) { group -> Bool in
+            group.addTask {
+                await gate.acquire()
+                gate.release()
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)   // let it enqueue
+            gate.release()                                     // free one slot
+            var done = false
+            for await ok in group where ok { done = true }
+            return done
+        }
+        XCTAssertTrue(thirdFinished, "blocked acquirer never resumed")
+
+        gate.release()
+        gate.release()                // release the two original holds
+        gate.setLimit(OCRService.defaultVisionConcurrency)
+    }
+
+    /// High-contention stress: many tasks acquire → random short hold → release.
+    /// The old implementation could deadlock here; run several limits/rounds.
+    func testVisionGateStressNoHang() async {
+        let gate = OCRService.visionGate
+        for limit in [1, 2, 4, 16] {
+            for _ in 0..<3 {
+                gate.setLimit(limit)
+                let tasks = 1000
+                await withTaskGroup(of: Bool.self) { group in
+                    for _ in 0..<tasks {
+                        group.addTask {
+                            await gate.acquire()
+                            try? await Task.sleep(nanoseconds: UInt64.random(in: 0...5_000_000))
+                            gate.release()
+                            return true
+                        }
+                    }
+                    var done = 0
+                    for await ok in group where ok { done += 1 }
+                    XCTAssertEqual(done, tasks, "gate deadlocked at limit \(limit)")
+                }
+            }
+        }
+        gate.setLimit(OCRService.defaultVisionConcurrency)
     }
 
     // MARK: - PDF render scale

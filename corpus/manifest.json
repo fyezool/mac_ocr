@@ -1,5 +1,5 @@
 {
-  "corpus_version" : "1.0",
+  "corpus_version" : "1.1",
   "files" : [
     {
       "filename" : "printed.png",
@@ -42,12 +42,12 @@
       "reference" : "rotated.txt"
     },
     {
-      "filename" : "cursive.png",
-      "id" : "cursive",
+      "filename" : "script_font.png",
+      "id" : "script_font",
       "language" : "en-US",
-      "layout" : "cursive",
-      "notes" : "Cursive script font, handwriting-like",
-      "reference" : "cursive.txt"
+      "layout" : "script_font",
+      "notes" : "Cursive SCRIPT FONT (Apple Chancery) — font recognition, not handwriting recognition",
+      "reference" : "script_font.txt"
     },
     {
       "filename" : "malay.png",
@@ -96,9 +96,20 @@
       "layout" : "pdf",
       "notes" : "Single-page PDF — exercises the (page N) path",
       "reference" : "statement.txt"
+    },
+    {
+      "filename" : "statement2.pdf",
+      "id" : "statement2",
+      "language" : "en-MS",
+      "layout" : "pdf",
+      "notes" : "Two-page PDF — validates page-indexed reference lookup",
+      "reference" : [
+        "statement2.page-001.txt",
+        "statement2.page-002.txt"
+      ]
     }
   ],
-  "generated_at" : "2026-08-14T15:31:14Z",
+  "generated_at" : "2026-08-15T03:18:40Z",
   "generator" : "tools\/gen_corpus.swift",
   "schema_version" : "1.0"
 }

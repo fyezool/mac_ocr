@@ -13,14 +13,22 @@ public struct OCRItem: Codable, Sendable {
     public let duration: TimeInterval
     public let loadMs: Double?
     public let visionMs: Double?
+    /// Time spent waiting for a Vision-gate slot. `visionMs` is measured AFTER
+    /// the gate is acquired, so it is pure Vision execution, not queue wait.
+    public let queueWaitMs: Double?
+    /// Full path the item was produced from (nil when constructed by callers
+    /// that only have a filename, e.g. the HTTP server's temp files).
+    public let sourcePath: String?
 
-    public init(filename: String, text: String, error: String?, duration: TimeInterval, loadMs: Double? = nil, visionMs: Double? = nil) {
+    public init(filename: String, text: String, error: String?, duration: TimeInterval, loadMs: Double? = nil, visionMs: Double? = nil, queueWaitMs: Double? = nil, sourcePath: String? = nil) {
         self.filename = filename
         self.text = text
         self.error = error
         self.duration = duration
         self.loadMs = loadMs
         self.visionMs = visionMs
+        self.queueWaitMs = queueWaitMs
+        self.sourcePath = sourcePath
     }
 }
 
@@ -44,8 +52,11 @@ public struct OCRDetailedItem: Codable, Sendable {
     public let minConfidence: Double?
     public let p10Confidence: Double?
     public let lowConfidenceRatio: Double?
+    /// Full path the item was produced from — used for collision-free adaptive
+    /// retry matching instead of filenames (which collide across directories).
+    public let sourcePath: String?
 
-    public init(filename: String, text: String, error: String?, duration: TimeInterval, meanConfidence: Double?, minConfidence: Double? = nil, p10Confidence: Double? = nil, lowConfidenceRatio: Double? = nil) {
+    public init(filename: String, text: String, error: String?, duration: TimeInterval, meanConfidence: Double?, minConfidence: Double? = nil, p10Confidence: Double? = nil, lowConfidenceRatio: Double? = nil, sourcePath: String? = nil) {
         self.filename = filename
         self.text = text
         self.error = error
@@ -54,6 +65,7 @@ public struct OCRDetailedItem: Codable, Sendable {
         self.minConfidence = minConfidence
         self.p10Confidence = p10Confidence
         self.lowConfidenceRatio = lowConfidenceRatio
+        self.sourcePath = sourcePath
     }
 }
 
@@ -189,7 +201,8 @@ public enum ConcurrencyPolicy: Sendable {
 /// FIFO async semaphore bounding process-wide in-flight Vision `perform` calls.
 /// Uses `OSAllocatedUnfairLock` (not an actor) so the limit can be raised
 /// synchronously from a non-async `main` and released via `defer`.
-private final class VisionGate: @unchecked Sendable {
+/// `internal` so the OCRCore test target can stress it directly.
+final class VisionGate: @unchecked Sendable {
     private struct State {
         var limit: Int
         var active = 0
@@ -204,17 +217,22 @@ private final class VisionGate: @unchecked Sendable {
 
     /// Async-acquire; returns immediately while under the budget, otherwise
     /// suspends until a slot frees up (FIFO).
+    ///
+    /// The capacity check, claim, and waiter-enqueue happen in ONE critical
+    /// section. A separate check-then-enqueue would race with `release()`:
+    /// a release between the check (gate full) and the enqueue would see an
+    /// empty waiter list, admit nobody, and leave the new waiter parked forever.
     func acquire() async {
-        let granted = lock.withLock { state -> Bool in
-            if state.active < state.limit {
-                state.active += 1
-                return true
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { state -> Bool in
+                if state.active < state.limit, state.waiters.isEmpty {
+                    state.active += 1
+                    return true
+                }
+                state.waiters.append(continuation)
+                return false
             }
-            return false
-        }
-        if granted { return }
-        await withCheckedContinuation { cont in
-            lock.withLock { state in state.waiters.append(cont) }
+            if resumeNow { continuation.resume() }
         }
     }
 
@@ -275,7 +293,7 @@ public enum OCRService {
     /// benchmark running in the same process.
     public static let defaultVisionConcurrency = 4
 
-    private static let visionGate = VisionGate(limit: OCRService.defaultVisionConcurrency)
+    static let visionGate = VisionGate(limit: OCRService.defaultVisionConcurrency)
 
     /// Raise the process-wide Vision request budget. The benchmark opts into a
     /// higher budget (its safety ceiling is 16) so the concurrency sweep stays
@@ -366,12 +384,40 @@ public enum OCRService {
         return (Double(dist) / Double(r.count), dist, r.count)
     }
 
+    /// Strict character-level CER — case-, whitespace-, and punctuation-sensitive.
+    /// Reported alongside the normalized metrics so punctuation/case regressions
+    /// can't hide behind normalization.
+    public static func cerStrictDetail(reference: String, predicted: String) -> (rate: Double, dist: Int, refCount: Int) {
+        let r = Array(reference)
+        let p = Array(predicted)
+        guard !r.isEmpty else { return (p.isEmpty ? 0 : 1, p.count, 0) }
+        let dist = levenshteinDistance(r, p)
+        return (Double(dist) / Double(r.count), dist, r.count)
+    }
+
+    /// Strict word-level WER — no case or whitespace normalization.
+    public static func werStrictDetail(reference: String, predicted: String) -> (rate: Double, dist: Int, refCount: Int) {
+        let r = reference.split(separator: " ").map(String.init)
+        let p = predicted.split(separator: " ").map(String.init)
+        guard !r.isEmpty else { return (p.isEmpty ? 0 : 1, p.count, 0) }
+        let dist = levenshteinDistance(r, p)
+        return (Double(dist) / Double(r.count), dist, r.count)
+    }
+
     /// Strip the "(page N)" suffix and extension from an OCR item filename.
     public static func baseName(_ filename: String) -> String {
         if let range = filename.range(of: " (page ") {
             return (String(filename[..<range.lowerBound]) as NSString).deletingPathExtension
         }
         return (filename as NSString).deletingPathExtension
+    }
+
+    /// Extract the page number from "foo.pdf (page 3)" → 3, else nil. Used to
+    /// resolve the page-indexed reference convention `foo.page-NNN.txt`.
+    public static func pageNumber(from filename: String) -> Int? {
+        guard let range = filename.range(of: " (page "),
+              let close = filename[range.upperBound...].firstIndex(of: ")") else { return nil }
+        return Int(filename[range.upperBound..<close])
     }
 
     public static func percentileValue(_ values: [Double], _ p: Double) -> Double? {
@@ -503,16 +549,20 @@ public enum OCRService {
             imageData = try autoreleasepool { try Data(contentsOf: url) }
         } catch {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            return (index, OCRDetailedItem(filename: url.lastPathComponent, text: "", error: "Could not load image", duration: elapsed, meanConfidence: nil))
+            return (index, OCRDetailedItem(filename: url.lastPathComponent, text: "", error: "Could not load image", duration: elapsed, meanConfidence: nil, sourcePath: path))
         }
+        let bounded = boundedImageData(imageData)
+
+        await visionGate.acquire()
+        defer { visionGate.release() }
 
         do {
-            let (text, stats) = try await recognizeTextWithConfidence(in: imageData, config: config)
+            let (text, stats) = try await recognizeTextWithConfidence(in: bounded, config: config)
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            return (index, OCRDetailedItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed, meanConfidence: stats.mean, minConfidence: stats.min, p10Confidence: stats.p10, lowConfidenceRatio: stats.lowRatio))
+            return (index, OCRDetailedItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed, meanConfidence: stats.mean, minConfidence: stats.min, p10Confidence: stats.p10, lowConfidenceRatio: stats.lowRatio, sourcePath: path))
         } catch {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            return (index, OCRDetailedItem(filename: url.lastPathComponent, text: "", error: error.localizedDescription, duration: elapsed, meanConfidence: nil))
+            return (index, OCRDetailedItem(filename: url.lastPathComponent, text: "", error: error.localizedDescription, duration: elapsed, meanConfidence: nil, sourcePath: path))
         }
     }
 
@@ -526,8 +576,6 @@ public enum OCRService {
         request.automaticallyDetectsLanguage = config.automaticallyDetectsLanguage
         if !config.recognitionLanguages.isEmpty { request.recognitionLanguages = config.recognitionLanguages }
         if !config.customWords.isEmpty { request.customWords = config.customWords }
-        await visionGate.acquire()
-        defer { visionGate.release() }
         let observations = try await request.perform(on: data)
         let result = reconstructParagraphsWithConfidence(from: observations)
         return (result.text, result.stats)
@@ -553,19 +601,30 @@ public enum OCRService {
             imageData = try autoreleasepool { try Data(contentsOf: url) }
         } catch {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            return (index, OCRItem(filename: url.lastPathComponent, text: "", error: "Could not load image", duration: elapsed))
+            return (index, OCRItem(filename: url.lastPathComponent, text: "", error: "Could not load image", duration: elapsed, sourcePath: path))
         }
         let loadMs = (CFAbsoluteTimeGetCurrent() - loadStart) * 1000
+        // Enforce the decoded-pixel budget before Vision ever sees the bitmap:
+        // a 12k×12k image would otherwise decode a huge buffer regardless of
+        // the constant existing.
+        let bounded = boundedImageData(imageData)
+
+        // One Vision-gate slot per file; queue wait is measured so visionMs
+        // below is pure Vision execution, not contention.
+        let queueStart = CFAbsoluteTimeGetCurrent()
+        await visionGate.acquire()
+        let queueWaitMs = (CFAbsoluteTimeGetCurrent() - queueStart) * 1000
+        defer { visionGate.release() }
 
         do {
             let visionStart = CFAbsoluteTimeGetCurrent()
-            let text = try await recognizeText(in: imageData, config: config)
+            let text = try await recognizeText(in: bounded, config: config)
             let visionMs = (CFAbsoluteTimeGetCurrent() - visionStart) * 1000
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            return (index, OCRItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed, loadMs: loadMs, visionMs: visionMs))
+            return (index, OCRItem(filename: url.lastPathComponent, text: text, error: nil, duration: elapsed, loadMs: loadMs, visionMs: visionMs, queueWaitMs: queueWaitMs, sourcePath: path))
         } catch {
             let elapsed = CFAbsoluteTimeGetCurrent() - start
-            return (index, OCRItem(filename: url.lastPathComponent, text: "", error: error.localizedDescription, duration: elapsed, loadMs: loadMs))
+            return (index, OCRItem(filename: url.lastPathComponent, text: "", error: error.localizedDescription, duration: elapsed, loadMs: loadMs, queueWaitMs: queueWaitMs, sourcePath: path))
         }
     }
 
@@ -584,8 +643,6 @@ public enum OCRService {
                 if !config.customWords.isEmpty { opts.customWords = config.customWords }
                 if config.minimumTextHeight > 0 { opts.minimumTextHeightFraction = config.minimumTextHeight }
                 request.textRecognitionOptions = opts
-                await visionGate.acquire()
-                defer { visionGate.release() }
                 let observations = try await request.perform(on: data)
                 if let doc = observations.first?.document, !doc.text.transcript.isEmpty {
                     return reconstructDocumentText(from: doc)
@@ -601,8 +658,6 @@ public enum OCRService {
         request.automaticallyDetectsLanguage = config.automaticallyDetectsLanguage
         if !config.recognitionLanguages.isEmpty { request.recognitionLanguages = config.recognitionLanguages }
         if !config.customWords.isEmpty { request.customWords = config.customWords }
-        await visionGate.acquire()
-        defer { visionGate.release() }
         let observations = try await request.perform(on: data)
         return reconstructParagraphs(from: observations)
     }
@@ -642,8 +697,10 @@ public enum OCRService {
     /// Process a PDF document: render each page to an image and run Vision OCR
     /// on it. Each page becomes its own OCRItem (named `file.pdf (page N)`).
     ///
-    /// Pages are processed sequentially to keep ANE working set / RSS bounded,
+    /// Pages are processed sequentially to keep the ANE working set / RSS bounded,
     /// and each page's render artifacts are released via `autoreleasepool`.
+    /// (The empirical ~32MB working-set cliff is workload/device-observed, not a
+    /// documented hardware budget.)
     private static func processPDF(_ url: URL, config: OCRConfiguration) async -> [OCRItem] {
         guard let doc = PDFDocument(url: url) else {
             return [OCRItem(filename: url.lastPathComponent, text: "", error: "Could not load PDF", duration: 0)]
@@ -662,17 +719,22 @@ public enum OCRService {
                 pngData = try renderPDFPage(doc, pageIndex: pageIndex)
             } catch {
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
-                items.append(OCRItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed))
+                items.append(OCRItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed, sourcePath: url.path))
                 continue
             }
+
+            let queueStart = CFAbsoluteTimeGetCurrent()
+            await visionGate.acquire()
+            let queueWaitMs = (CFAbsoluteTimeGetCurrent() - queueStart) * 1000
+            defer { visionGate.release() }
 
             do {
                 let text = try await recognizeText(in: pngData, config: config)
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
-                items.append(OCRItem(filename: pageName, text: text, error: nil, duration: elapsed))
+                items.append(OCRItem(filename: pageName, text: text, error: nil, duration: elapsed, queueWaitMs: queueWaitMs, sourcePath: url.path))
             } catch {
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
-                items.append(OCRItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed))
+                items.append(OCRItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed, queueWaitMs: queueWaitMs, sourcePath: url.path))
             }
         }
 
@@ -697,17 +759,20 @@ public enum OCRService {
                 pngData = try renderPDFPage(doc, pageIndex: pageIndex)
             } catch {
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
-                items.append(OCRDetailedItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed, meanConfidence: nil))
+                items.append(OCRDetailedItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed, meanConfidence: nil, sourcePath: url.path))
                 continue
             }
+
+            await visionGate.acquire()
+            defer { visionGate.release() }
 
             do {
                 let (text, stats) = try await recognizeTextWithConfidence(in: pngData, config: config)
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
-                items.append(OCRDetailedItem(filename: pageName, text: text, error: nil, duration: elapsed, meanConfidence: stats.mean, minConfidence: stats.min, p10Confidence: stats.p10, lowConfidenceRatio: stats.lowRatio))
+                items.append(OCRDetailedItem(filename: pageName, text: text, error: nil, duration: elapsed, meanConfidence: stats.mean, minConfidence: stats.min, p10Confidence: stats.p10, lowConfidenceRatio: stats.lowRatio, sourcePath: url.path))
             } catch {
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart
-                items.append(OCRDetailedItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed, meanConfidence: nil))
+                items.append(OCRDetailedItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed, meanConfidence: nil, sourcePath: url.path))
             }
         }
 
@@ -864,6 +929,10 @@ public enum OCRService {
             return (index, OCRStructuredItem(filename: url.lastPathComponent, text: "", error: "Could not load image", duration: elapsed, confidence: nil, blocks: []))
         }
         let bounded = boundedImageData(imageData)
+
+        await visionGate.acquire()
+        defer { visionGate.release() }
+
         do {
             let result = try await recognizeStructured(in: bounded, config: config)
             let elapsed = CFAbsoluteTimeGetCurrent() - start
@@ -888,8 +957,6 @@ public enum OCRService {
         request.automaticallyDetectsLanguage = config.automaticallyDetectsLanguage
         if !config.recognitionLanguages.isEmpty { request.recognitionLanguages = config.recognitionLanguages }
         if !config.customWords.isEmpty { request.customWords = config.customWords }
-        await visionGate.acquire()
-        defer { visionGate.release() }
         let observations = try await request.perform(on: data)
         let reconstruction = reconstructParagraphsWithConfidence(from: observations)
         let blocks = observations.compactMap { obs -> OCRBlock? in
@@ -920,6 +987,8 @@ public enum OCRService {
                 items.append(OCRStructuredItem(filename: pageName, text: "", error: error.localizedDescription, duration: elapsed, confidence: nil, blocks: []))
                 continue
             }
+            await visionGate.acquire()
+            defer { visionGate.release() }
             do {
                 let result = try await recognizeStructured(in: pngData, config: config)
                 let elapsed = CFAbsoluteTimeGetCurrent() - pageStart

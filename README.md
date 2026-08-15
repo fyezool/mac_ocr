@@ -226,15 +226,31 @@ BENCH_RUNS=3 tools/cross_bench.sh
 python3 tools/cross_compare.py          # prints table + writes corpus/results/comparison.md
 ```
 
-- 12 samples: printed paragraph, monospaced receipt, small text, two-column,
-  rotated, cursive, Malay, low-res, noisy, dense numbers, long document, one-page
-  PDF.
+- 13 samples: printed paragraph, monospaced receipt, small text, two-column,
+  rotated, script font (Apple Chancery — *font recognition, not handwriting*),
+  Malay, low-res, noisy, dense numbers, long document, one-page PDF, and a
+  two-page PDF (which validates the per-page reference convention
+  `foo.page-NNN.txt`).
+- Metrics are reported **normalized** (case/whitespace/punctuation insensitive)
+  **and strict** (`cer_macro_strict` etc.), so punctuation/case regressions
+  can't hide behind normalization.
 - The runner fixes `--concurrency 4` and tags each result JSON by
   hostname/model/macOS, e.g. `legacy_accurate_mbp_Mac14-2_macos15.json`.
 - `CORPUS_NATIVE=1` additionally runs the macOS 26 documents engine
   (`RecognizeDocumentsRequest`) as a machine-local signal; the legacy pass
   remains the cross-OS baseline.
 - Per-machine result JSONs live under `corpus/results/` and are gitignored.
+- `cross_compare.py` prints per-machine CER (normalized + strict), WER, exact%,
+  p95 latency and throughput, plus a **per-category CER matrix** so it's
+  obvious where Vision breaks.
+
+> **Synthetic vs real data:** this is a **synthetic** corpus (`NSBitmapImageRep`
+> + system fonts, ground truth derived from the render string) — it measures
+> how well Vision reads text rendered by Apple's own font stack, which is
+> reproducible but *not* representative of real-world capture (JPEG/camera/
+> shadows/blur/real handwriting). Treat its absolute numbers as an upper bound
+> on real-world accuracy. A real-world corpus (`corpus/real/v1/…`) is the
+> intended next step and needs real labeled images.
 
 ## Requirements
 
