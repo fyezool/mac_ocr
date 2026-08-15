@@ -564,12 +564,12 @@ private let webHTML = """
   h1{font-size:24px;font-weight:700;letter-spacing:-0.02em;margin-bottom:4px}
   .sub{color:var(--secondary);font-size:14px;margin-bottom:24px;line-height:1.4}
 
-  /* Drop Zone — drag only, no click picker */
+  /* Drop Zone — tap to browse (label wrapping a hidden file input) or drag & drop */
   .zone{
     border:2px dashed var(--drop-border);border-radius:16px;
     padding:36px 24px;text-align:center;margin-bottom:20px;
     background:var(--drop-bg);
-    transition:all 0.25s ease;position:relative;
+    transition:all 0.25s ease;position:relative;cursor:pointer;
   }
   .zone.dragover{
     border-color:var(--drop-hover-border);
@@ -579,6 +579,11 @@ private let webHTML = """
   .zone-icon{font-size:40px;display:block;margin-bottom:12px;opacity:0.7;pointer-events:none}
   .zone p{color:var(--secondary);font-size:14px;line-height:1.5;pointer-events:none}
   .zone .hint{font-size:12px;color:var(--tertiary);margin-top:6px;pointer-events:none}
+  .zone .pick{
+    display:inline-block;margin-top:12px;padding:8px 18px;
+    border-radius:999px;background:var(--accent);color:#fff;
+    font-size:13px;font-weight:600;pointer-events:none;
+  }
 
   /* Button */
   .btn{
@@ -626,12 +631,14 @@ private let webHTML = """
   <p class="sub">Upload images to extract text</p>
 
   <form method="POST" action="/ocr" enctype="multipart/form-data" id="ocr-form">
-    <div class="zone" id="dz">
+    <label class="zone" id="dz" for="file">
+      <input type="file" id="file" multiple accept="image/*,application/pdf" class="sr-only" tabindex="-1">
       <span class="zone-icon" aria-hidden="true">📁</span>
-      <p>Drag &amp; drop images here</p>
+      <p>Tap or drag &amp; drop images here</p>
       <p class="hint">PNG, JPG, GIF, BMP, TIFF, HEIC, WebP, PDF</p>
+      <span class="pick" aria-hidden="true">Choose Files</span>
       <div id="cnt" aria-live="polite" style="font-size:13px;font-weight:600;margin-top:10px;color:var(--accent)"></div>
-    </div>
+    </label>
 
     <div id="cam-ui" class="cam-row" style="display:none">
       <button class="btn" id="cam" type="button">📷 Take a Picture</button>
@@ -658,7 +665,16 @@ private let webHTML = """
   let sel=[];
   const exts=new Set(['png','jpg','jpeg','gif','bmp','tiff','tif','heic','webp','pdf']);
 
-  // Drag only — no click picker
+  // Tap-to-browse: the zone is a <label> wrapping this hidden input, so tapping
+  // it opens the OS file/photo picker (works on mobile). Reset value after each
+  // pick so selecting the same file again re-fires `change`.
+  const fileInput=document.getElementById('file');
+  fileInput.addEventListener('change',e=>{
+    if(e.target.files?.length){sel=[...e.target.files];updateCounter()}
+    e.target.value='';
+  });
+
+  // Drag & drop (desktop)
   dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover')},{passive:false});
   dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
   dz.addEventListener('drop',e=>{

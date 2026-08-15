@@ -136,6 +136,19 @@ final class ServerIntegrationTests: XCTestCase {
         XCTAssertTrue(String(data: data, encoding: .utf8)?.contains("\"status\":\"ok\"") == true)
     }
 
+    func testServerServesFilePicker() async throws {
+        let (srv, url) = try await startServer()
+        defer { srv.stop() }
+
+        let (data, resp) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200)
+        let html = String(data: data, encoding: .utf8) ?? ""
+        XCTAssertTrue(html.contains("type=\"file\""), "web UI missing a file input")
+        XCTAssertTrue(html.contains("id=\"file\""), "web UI file input missing id")
+        XCTAssertTrue(html.contains("accept=\"image/*,application/pdf\""), "file input accept list wrong")
+        XCTAssertTrue(html.contains("for=\"file\""), "tap zone is not wired to the picker")
+    }
+
     func testConcurrentRequestsAllSucceed() async throws {
         guard let png = makePNG() else { return XCTFail("could not make PNG") }
         let (srv, url) = try await startServer()
