@@ -26,10 +26,20 @@ public enum ServerSupport {
     /// Split a multipart/form-data body by boundary, collecting `name="image"`
     /// file parts and a `name="options"` text part.
     public static func parseMultipart(_ body: Data, boundary: String) -> ParsedUpload {
+        // Reject absurd boundaries early (DoS via huge search pattern)
+        let boundaryBytes = Array(boundary.utf8)
+        guard !boundary.isEmpty, boundary.count <= 1024,
+              !boundaryBytes.contains(13), !boundaryBytes.contains(10), !boundaryBytes.contains(0) else {
+            return ParsedUpload()
+        }
         let bm = "--\(boundary)".data(using: .utf8)!
         var parsed = ParsedUpload()
         var pos = body.startIndex
+        var partCount = 0
+        let maxParts = 32
+        let maxOptionsBytes = 16 * 1024
         while pos < body.endIndex {
+            guard partCount < maxParts else { break }
             guard let bs = body[pos...].range(of: bm) else { break }
             let ps = bs.upperBound
             var pe = body.endIndex
@@ -48,10 +58,13 @@ public enum ServerSupport {
                 if h.contains("name=\"image\"") {
                     parsed.files.append(UploadedFile(name: extractFilename(from: h) ?? "upload", data: content))
                 } else if h.contains("name=\"options\"") {
-                    parsed.optionsJSON = String(data: content, encoding: .utf8)
+                    // Cap options field to prevent memory DoS
+                    let capped = content.count > maxOptionsBytes ? content.prefix(maxOptionsBytes) : content
+                    parsed.optionsJSON = String(data: Data(capped), encoding: .utf8)
                 }
             }
             pos = pe
+            partCount += 1
         }
         return parsed
     }
@@ -59,11 +72,33 @@ public enum ServerSupport {
     public static func extractFilename(from headers: String) -> String? {
         guard let r = headers.range(of: "filename=\"") else { return nil }
         let a = headers[r.upperBound...]
-        return a.firstIndex(of: "\"").map { String(a[a.startIndex..<$0]) }
+        guard let end = a.firstIndex(of: "\"") else { return nil }
+        var raw = String(a[a.startIndex..<end])
+        // Strip CRLF injection, null bytes before any use
+        raw = raw.replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\0", with: "")
+        // Keep only the last path component, strip directory traversal
+        raw = (raw as NSString).lastPathComponent
+        // Remove remaining control characters
+        raw = raw.filter { !$0.isNewline && !$0.unicodeScalars.contains(where: { $0.value < 32 }) }
+        // Whitelist safe characters; replace others with '_' to block header injection remnants like "a.pngInjected: evil"
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-() "))
+        raw = String(raw.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" })
+        // Collapse repeated underscores and trim
+        while raw.contains("__") { raw = raw.replacingOccurrences(of: "__", with: "_") }
+        // Truncate to reasonable length
+        if raw.count > 255 { raw = String(raw.prefix(255)) }
+        return raw.isEmpty ? nil : raw
     }
 
     /// Verify uploaded bytes against their claimed extension using magic bytes.
     public static func hasValidContent(_ data: Data, ext: String) -> Bool {
+        // PDF only needs 5 bytes for "%PDF-", other formats need 8-12.
+        if ext == "pdf" {
+            guard data.count >= 5 else { return false }
+            return data.prefix(1024).range(of: Data("%PDF-".utf8)) != nil
+        }
         guard data.count >= 12 else { return false }
         let prefix = [UInt8](data.prefix(16))
         switch ext {
@@ -86,8 +121,6 @@ public enum ServerSupport {
             return Array(prefix.prefix(4)) == Array("RIFF".utf8)
                 && data.count >= 12
                 && [UInt8](data[data.startIndex + 8 ..< data.startIndex + 12]) == Array("WEBP".utf8)
-        case "pdf":
-            return data.prefix(1024).range(of: Data("%PDF-".utf8)) != nil
         default:
             return false
         }
@@ -99,6 +132,7 @@ public enum ServerSupport {
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
             .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&#39;")
     }
 
     /// Extract the `format` query parameter from a request path (default "html").
@@ -107,7 +141,11 @@ public enum ServerSupport {
         let query = String(path[q...].dropFirst())
         for pair in query.components(separatedBy: "&") {
             let kv = pair.components(separatedBy: "=")
-            if kv.count == 2, kv[0] == "format" { return kv[1].lowercased() }
+            if kv.count == 2, kv[0] == "format" {
+                let v = kv[1].lowercased()
+                if ["html", "json", "txt"].contains(v) { return v }
+                return "html"
+            }
         }
         return "html"
     }
@@ -198,13 +236,19 @@ public struct HTTPRequest {
         method = rL[0]
         path = rL[1]
         var h: [String: String] = [:]
+        var contentLengthValues: [String] = []
         for line in hL.dropFirst() {
             if let c = line.firstIndex(of: ":") {
                 let key = String(line[line.startIndex..<c]).trimmingCharacters(in: .whitespaces).lowercased()
-                h[key] = String(line[line.index(after: c)...]).trimmingCharacters(in: .whitespaces)
+                let value = String(line[line.index(after: c)...].trimmingCharacters(in: .whitespaces))
+                if key == "content-length" { contentLengthValues.append(value) }
+                h[key] = value
             }
         }
+        // Reject duplicate Content-Length (request smuggling protection)
+        if contentLengthValues.count > 1 { return nil }
         contentLength = h["content-length"].flatMap(Int.init)
+        if let cl = contentLength, cl < 0 { return nil }
         let payload = Data(data[hdrEnd.upperBound...])
         if let length = contentLength, length >= 0 {
             body = Data(payload.prefix(length))
